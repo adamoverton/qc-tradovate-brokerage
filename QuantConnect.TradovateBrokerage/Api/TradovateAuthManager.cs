@@ -88,7 +88,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 {
                     name = _username,
                     password = _password,
-                    appId = _clientId,
+                    appId = "QuantConnect LEAN",
                     appVersion = "1.0",
                     deviceId = "QuantConnect",
                     cid = _clientId,
@@ -98,11 +98,17 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 var jsonContent = JsonConvert.SerializeObject(payload);
                 var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
+                Console.WriteLine($"[TradovateAuth] POST {authUrl}");
+                Console.WriteLine($"[TradovateAuth] Payload: {jsonContent}");
+
                 var response = await _httpClient.PostAsync(authUrl, content);
+                var responseBody = await response.Content.ReadAsStringAsync();
+
+                Console.WriteLine($"[TradovateAuth] Status: {response.StatusCode}");
+                Console.WriteLine($"[TradovateAuth] Response: {responseBody}");
 
                 if (response.IsSuccessStatusCode)
                 {
-                    var responseBody = await response.Content.ReadAsStringAsync();
                     var jsonResponse = JObject.Parse(responseBody);
 
                     _accessToken = jsonResponse["accessToken"]?.ToString();
@@ -112,8 +118,10 @@ namespace QuantConnect.Brokerages.Tradovate.Api
 
                 return false;
             }
-            catch
+            catch (Exception ex)
             {
+                Console.WriteLine($"[TradovateAuth] Exception: {ex.Message}");
+                Console.WriteLine($"[TradovateAuth] StackTrace: {ex.StackTrace}");
                 return false;
             }
         }
