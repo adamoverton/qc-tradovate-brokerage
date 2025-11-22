@@ -27,7 +27,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace QuantConnect.Brokerages.Template.Tests
+namespace QuantConnect.Brokerages.Tradovate.Tests
 {
     /// <summary>
     /// This algorithm tests the order types, security types, data types
@@ -106,7 +106,7 @@ namespace QuantConnect.Brokerages.Template.Tests
     /// has received at least one data point for each of the symbols added in the
     /// beggining.
     /// </summary>
-    public abstract class TemplateFeatureRegressionAlgorithm: QCAlgorithm
+    public abstract class TradovateFeatureRegressionAlgorithm: QCAlgorithm
     {
         /// <summary>
         /// Index of the order type to test from the _orderTypes list

@@ -3,16 +3,16 @@
     <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
     <TargetFramework>net9.0</TargetFramework>
-    <Product>QuantConnect.Brokerages.Template</Product>
-    <AssemblyName>QuantConnect.Brokerages.Template</AssemblyName>
-    <RootNamespace>QuantConnect.Brokerages.Template</RootNamespace>
-    <AssemblyTitle>QuantConnect.Brokerages.Template</AssemblyTitle>
+    <Product>QuantConnect.Brokerages.Tradovate</Product>
+    <AssemblyName>QuantConnect.Brokerages.Tradovate</AssemblyName>
+    <RootNamespace>QuantConnect.Brokerages.Tradovate</RootNamespace>
+    <AssemblyTitle>QuantConnect.Brokerages.Tradovate</AssemblyTitle>
     <OutputType>Library</OutputType>
     <OutputPath>bin\$(Configuration)\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <Description>QuantConnect LEAN Template Brokerage: Brokerage Template plugin for Lean</Description>
+    <Description>QuantConnect LEAN Tradovate Brokerage: Brokerage Tradovate plugin for Lean</Description>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugType>full</DebugType>
@@ -22,9 +22,6 @@
     <DebugType>pdbonly</DebugType>
     <OutputPath>bin\Release\</OutputPath>
   </PropertyGroup>
-  <ItemGroup>
-    <Compile Include="..\..\Lean\Common\Properties\SharedAssemblyInfo.cs" Link="Properties\SharedAssemblyInfo.cs" />
-  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
     <PackageReference Include="QuantConnect.Brokerages" Version="2.5.*" />

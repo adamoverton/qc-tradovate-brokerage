@@ -9,10 +9,10 @@
         <Copyright>Copyright ©  2021</Copyright>
         <TestProjectType>UnitTest</TestProjectType>
         <OutputPath>bin\$(Configuration)\</OutputPath>
-        <Product>QuantConnect.Brokerages.Template.Tests</Product>
-        <AssemblyName>QuantConnect.Brokerages.Template.Tests</AssemblyName>
-        <RootNamespace>QuantConnect.Brokerages.Template.Tests</RootNamespace>
-        <AssemblyTitle>QuantConnect.Brokerages.Template.Tests</AssemblyTitle>
+        <Product>QuantConnect.Brokerages.Tradovate.Tests</Product>
+        <AssemblyName>QuantConnect.Brokerages.Tradovate.Tests</AssemblyName>
+        <RootNamespace>QuantConnect.Brokerages.Tradovate.Tests</RootNamespace>
+        <AssemblyTitle>QuantConnect.Brokerages.Tradovate.Tests</AssemblyTitle>
         <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     </PropertyGroup>
 
@@ -29,9 +29,8 @@
         <Using Include="NUnit.Framework.Legacy.ClassicAssert" Alias="Assert" />
     </ItemGroup>
     <ItemGroup>
-      <ProjectReference Include="..\..\Lean\Tests\QuantConnect.Tests.csproj" />
-      <ProjectReference Include="..\QuantConnect.TemplateBrokerage.ToolBox\QuantConnect.TemplateBrokerage.ToolBox.csproj" />
-      <ProjectReference Include="..\QuantConnect.TemplateBrokerage\QuantConnect.TemplateBrokerage.csproj" />
+      <ProjectReference Include="..\QuantConnect.TradovateBrokerage.ToolBox\QuantConnect.TradovateBrokerage.ToolBox.csproj" />
+      <ProjectReference Include="..\QuantConnect.TradovateBrokerage\QuantConnect.TradovateBrokerage.csproj" />
     </ItemGroup>
 
     <ItemGroup>

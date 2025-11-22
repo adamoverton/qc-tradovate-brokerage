@@ -19,13 +19,15 @@ using QuantConnect.Brokerages;
 using QuantConnect.Interfaces;
 using QuantConnect.Securities;
 using System.Collections.Generic;
+using QuantConnect.Configuration;
+using QuantConnect.Util;
 
-namespace QuantConnect.Brokerages.Template
+namespace QuantConnect.Brokerages.Tradovate
 {
     /// <summary>
-    /// Provides a template implementation of BrokerageFactory
+    /// Provides factory for Tradovate brokerage
     /// </summary>
-    public class TemplateBrokerageFactory : BrokerageFactory
+    public class TradovateBrokerageFactory : BrokerageFactory
     {
         /// <summary>
         /// Gets the brokerage data required to run the brokerage from configuration/disk
@@ -37,9 +39,9 @@ namespace QuantConnect.Brokerages.Template
         public override Dictionary<string, string> BrokerageData { get; }
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="TemplateBrokerageFactory"/> class
+        /// Initializes a new instance of the <see cref="TradovateBrokerageFactory"/> class
         /// </summary>
-        public TemplateBrokerageFactory() : base(typeof(TemplateBrokerage))
+        public TradovateBrokerageFactory() : base(typeof(TradovateBrokerage))
         {
         }
 
@@ -49,7 +51,7 @@ namespace QuantConnect.Brokerages.Template
         /// <param name="orderProvider">The order provider</param>
         public override IBrokerageModel GetBrokerageModel(IOrderProvider orderProvider)
         {
-            throw new NotImplementedException();
+            return new DefaultBrokerageModel();
         }
 
         /// <summary>
@@ -60,7 +62,19 @@ namespace QuantConnect.Brokerages.Template
         /// <returns>A new brokerage instance</returns>
         public override IBrokerage CreateBrokerage(LiveNodePacket job, IAlgorithm algorithm)
         {
-            throw new NotImplementedException();
+            var username = Config.Get("tradovate-username");
+            var password = Config.Get("tradovate-password");
+            var clientId = Config.Get("tradovate-client-id");
+            var clientSecret = Config.Get("tradovate-client-secret");
+            var environment = Config.Get("environment", "tradovate-demo");
+
+            var tradovateEnvironment = environment.Contains("live")
+                ? TradovateEnvironment.Live
+                : TradovateEnvironment.Demo;
+
+            var aggregator = Composer.Instance.GetPart<IDataAggregator>();
+
+            return new TradovateBrokerage(aggregator, username, password, clientId, clientSecret, tradovateEnvironment);
         }
 
         /// <summary>
@@ -68,7 +82,7 @@ namespace QuantConnect.Brokerages.Template
         /// </summary>
         public override void Dispose()
         {
-            throw new NotImplementedException();
+            // Nothing to dispose
         }
     }
 }
