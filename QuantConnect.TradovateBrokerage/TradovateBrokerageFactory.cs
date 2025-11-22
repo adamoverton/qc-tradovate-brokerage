@@ -21,6 +21,8 @@ using QuantConnect.Securities;
 using System.Collections.Generic;
 using QuantConnect.Configuration;
 using QuantConnect.Util;
+using QuantConnect.Data;
+using QuantConnect.Brokerages.Tradovate.Api;
 
 namespace QuantConnect.Brokerages.Tradovate
 {
