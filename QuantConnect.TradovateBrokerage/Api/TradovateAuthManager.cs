@@ -113,7 +113,21 @@ namespace QuantConnect.Brokerages.Tradovate.Api
 
                     _accessToken = jsonResponse["accessToken"]?.ToString();
 
-                    return !string.IsNullOrEmpty(_accessToken);
+                    if (!string.IsNullOrEmpty(_accessToken))
+                    {
+                        // Save token to file for reuse
+                        var tokenPath = "/tmp/tradovate_token.txt";
+                        try
+                        {
+                            System.IO.File.WriteAllText(tokenPath, _accessToken);
+                            Console.WriteLine($"[TradovateAuth] Token saved to {tokenPath}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[TradovateAuth] Failed to save token: {ex.Message}");
+                        }
+                        return true;
+                    }
                 }
 
                 return false;

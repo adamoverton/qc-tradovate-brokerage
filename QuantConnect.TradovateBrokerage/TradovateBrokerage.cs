@@ -47,7 +47,27 @@ namespace QuantConnect.Brokerages.Tradovate
         /// <summary>
         /// Returns true if we're currently connected to the broker
         /// </summary>
-        public override bool IsConnected => _webSocketClient?.IsConnected ?? false;
+        public override bool IsConnected
+        {
+            get
+            {
+                var connected = _webSocketClient?.IsConnected ?? false;
+                Log.Trace($"TradovateBrokerage.IsConnected: {connected}");
+                return connected;
+            }
+        }
+
+        /// <summary>
+        /// Gets the account base currency
+        /// </summary>
+        public override string AccountBaseCurrency
+        {
+            get
+            {
+                Log.Trace("TradovateBrokerage.AccountBaseCurrency: returning USD");
+                return "USD";
+            }
+        }
 
         /// <summary>
         /// Parameterless constructor for brokerage
@@ -173,27 +193,9 @@ namespace QuantConnect.Brokerages.Tradovate
         /// <returns>The current holdings from the account</returns>
         public override List<Holding> GetAccountHoldings()
         {
-            if (_restClient == null)
-            {
-                return new List<Holding>();
-            }
-
-            try
-            {
-                var positions = _restClient.GetPositionList();
-                return positions.Select(p => new Holding
-                {
-                    Symbol = Symbol.Empty,
-                    Quantity = p.NetPos,
-                    AveragePrice = 0,
-                    MarketPrice = 0
-                }).ToList();
-            }
-            catch (Exception ex)
-            {
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "GetAccountHoldings", $"Error getting holdings: {ex.Message}"));
-                return new List<Holding>();
-            }
+            // For now, return empty list since we don't have proper symbol mapping yet
+            // TODO: Map Tradovate contract IDs to QuantConnect symbols
+            return new List<Holding>();
         }
 
         /// <summary>

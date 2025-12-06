@@ -19,6 +19,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         private bool _isConnected;
         private bool _isAuthenticated;
         private int _requestId = 1;
+        private TaskCompletionSource<bool> _authenticationCompletionSource;
 
         public event EventHandler<string> MessageReceived;
         public event EventHandler<Exception> ErrorOccurred;
@@ -50,6 +51,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             {
                 _cancellationTokenSource = new CancellationTokenSource();
                 _webSocket = new ClientWebSocket();
+                _authenticationCompletionSource = new TaskCompletionSource<bool>();
 
                 await _webSocket.ConnectAsync(new Uri(_url), _cancellationTokenSource.Token);
 
@@ -61,6 +63,21 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 // Wait for 'o' (open frame) then authenticate
                 await Task.Delay(500); // Give time for open frame
                 await AuthenticateAsync();
+
+                // Wait for authentication to complete (with 10 second timeout)
+                var authTask = _authenticationCompletionSource.Task;
+                var timeoutTask = Task.Delay(10000);
+                var completedTask = await Task.WhenAny(authTask, timeoutTask);
+
+                if (completedTask == timeoutTask)
+                {
+                    throw new TimeoutException("Authentication timeout after 10 seconds");
+                }
+
+                if (!authTask.Result)
+                {
+                    throw new Exception("Authentication failed");
+                }
             }
             catch (Exception ex)
             {
@@ -255,6 +272,15 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                         {
                             _isAuthenticated = true;
                             OnConnectionStateChanged(true);
+
+                            // Signal that authentication is complete
+                            _authenticationCompletionSource?.TrySetResult(true);
+                        }
+                        else
+                        {
+                            // Authentication failed with non-200 status
+                            _isAuthenticated = false;
+                            _authenticationCompletionSource?.TrySetResult(false);
                         }
                     }
 
