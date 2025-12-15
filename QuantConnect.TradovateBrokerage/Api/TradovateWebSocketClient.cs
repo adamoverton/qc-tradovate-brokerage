@@ -9,6 +9,27 @@ using Newtonsoft.Json.Linq;
 
 namespace QuantConnect.Brokerages.Tradovate.Api
 {
+    /// <summary>
+    /// Event data for Tradovate order updates received via WebSocket
+    /// </summary>
+    public class TradovateOrderUpdate
+    {
+        public string EventType { get; set; }      // Created, Updated, Deleted
+        public string EntityType { get; set; }     // order, executionReport, fill
+        public long OrderId { get; set; }
+        public int AccountId { get; set; }
+        public int ContractId { get; set; }
+        public string OrdStatus { get; set; }      // Working, Filled, Cancelled, Rejected
+        public string Action { get; set; }         // Buy, Sell
+        public string OrderType { get; set; }      // Market, Limit, Stop, StopLimit
+        public int Qty { get; set; }
+        public int FilledQty { get; set; }
+        public decimal? Price { get; set; }
+        public decimal? StopPrice { get; set; }
+        public decimal? AvgFillPrice { get; set; }
+        public string Text { get; set; }           // Error/info message
+    }
+
     public class TradovateWebSocketClient : IDisposable
     {
         private readonly string _url;
@@ -24,6 +45,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         public event EventHandler<string> MessageReceived;
         public event EventHandler<Exception> ErrorOccurred;
         public event EventHandler<bool> ConnectionStateChanged;
+        public event EventHandler<TradovateOrderUpdate> OrderUpdateReceived;
 
         public bool IsConnected => _isConnected && _isAuthenticated;
 
@@ -164,6 +186,26 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             }
         }
 
+        /// <summary>
+        /// Subscribe to user data events (orders, positions, fills, cash balance changes)
+        /// </summary>
+        /// <param name="userId">The Tradovate user ID to subscribe to</param>
+        public void SubscribeUserSync(int userId)
+        {
+            try
+            {
+                // Tradovate format: operation\nid\nquery\nbody
+                // Body is JSON with users array
+                var body = JsonConvert.SerializeObject(new { users = new[] { userId } });
+                var subscribeMessage = $"user/syncrequest\n{_requestId++}\n\n{body}";
+                SendAsync(subscribeMessage).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                OnError(ex);
+            }
+        }
+
         public void SendMessage(string message)
         {
             try
@@ -187,7 +229,8 @@ namespace QuantConnect.Brokerages.Tradovate.Api
 
         private async Task ReceiveLoop()
         {
-            var buffer = new byte[8192];
+            // Large buffer for user/syncrequest which can return substantial initial payload
+            var buffer = new byte[65536];
 
             try
             {
@@ -284,6 +327,12 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                         }
                     }
 
+                    // Check for user/syncrequest events (order updates, fills, etc.)
+                    if (msg is JObject eventObj && eventObj.ContainsKey("e") && eventObj["e"]?.ToString() == "props")
+                    {
+                        ProcessPropsEvent(eventObj);
+                    }
+
                     // Pass the message to subscribers
                     MessageReceived?.Invoke(this, msg.ToString());
                 }
@@ -291,6 +340,49 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             catch (Exception ex)
             {
                 OnError(new Exception($"Failed to parse array frame: {ex.Message}"));
+            }
+        }
+
+        private void ProcessPropsEvent(JObject eventObj)
+        {
+            try
+            {
+                var data = eventObj["d"] as JObject;
+                if (data == null) return;
+
+                var entityType = data["entityType"]?.ToString();
+                var eventType = data["eventType"]?.ToString();
+                var entity = data["entity"] as JObject;
+
+                if (entity == null) return;
+
+                // Process order-related events
+                if (entityType == "order" || entityType == "executionReport")
+                {
+                    var orderUpdate = new TradovateOrderUpdate
+                    {
+                        EventType = eventType,
+                        EntityType = entityType,
+                        OrderId = entity["id"]?.Value<long>() ?? 0,
+                        AccountId = entity["accountId"]?.Value<int>() ?? 0,
+                        ContractId = entity["contractId"]?.Value<int>() ?? 0,
+                        OrdStatus = entity["ordStatus"]?.ToString(),
+                        Action = entity["action"]?.ToString(),
+                        OrderType = entity["orderType"]?.ToString(),
+                        Qty = entity["qty"]?.Value<int>() ?? entity["orderQty"]?.Value<int>() ?? 0,
+                        FilledQty = entity["filledQty"]?.Value<int>() ?? 0,
+                        Price = entity["price"]?.Value<decimal?>(),
+                        StopPrice = entity["stopPrice"]?.Value<decimal?>(),
+                        AvgFillPrice = entity["avgFillPrice"]?.Value<decimal?>(),
+                        Text = entity["text"]?.ToString()
+                    };
+
+                    OrderUpdateReceived?.Invoke(this, orderUpdate);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnError(new Exception($"Failed to process props event: {ex.Message}"));
             }
         }
 

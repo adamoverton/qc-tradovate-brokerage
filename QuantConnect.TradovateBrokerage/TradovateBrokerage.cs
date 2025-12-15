@@ -51,7 +51,9 @@ namespace QuantConnect.Brokerages.Tradovate
         private readonly TradovateEnvironment _environment;
         private readonly bool _useOAuth;
         private int? _cachedAccountId;
+        private int? _cachedUserId;
         private readonly Dictionary<string, int> _contractIdCache = new Dictionary<string, int>();
+        private readonly Dictionary<long, int> _brokerIdToQcOrderId = new Dictionary<long, int>();  // Maps Tradovate orderId to QC orderId
 
         /// <summary>
         /// Returns true if we're currently connected to the broker
@@ -110,7 +112,7 @@ namespace QuantConnect.Brokerages.Tradovate
         /// <param name="clientSecret">Tradovate client secret</param>
         /// <param name="environment">Demo or Live environment</param>
         // Increment this when making code changes to verify correct DLL is loaded
-        private const string BrokerageVersion = "2024-12-14-v3-regex-parsing";
+        private const string BrokerageVersion = "2024-12-15-v5-larger-ws-buffer";
 
         public TradovateBrokerage(string username, string password, string clientId, string clientSecret, TradovateEnvironment environment) : base("TradovateBrokerage")
         {
@@ -366,8 +368,9 @@ namespace QuantConnect.Brokerages.Tradovate
                     return false;
                 }
 
-                // Set broker ID on the order
+                // Set broker ID on the order and cache the mapping
                 order.BrokerId.Add(tradovateOrderId.ToString());
+                _brokerIdToQcOrderId[tradovateOrderId] = order.Id;
 
                 Log.Trace($"TradovateBrokerage.PlaceOrder(): Order {order.Id} placed successfully, broker ID: {tradovateOrderId}");
 
@@ -472,13 +475,32 @@ namespace QuantConnect.Brokerages.Tradovate
         {
             if (_restClient == null || string.IsNullOrEmpty(order.BrokerId.FirstOrDefault()))
             {
+                Log.Trace($"TradovateBrokerage.CancelOrder(): Cannot cancel - REST client null or no broker ID");
                 return false;
             }
 
             try
             {
                 var brokerId = long.Parse(order.BrokerId.First());
-                return _restClient.CancelOrder(brokerId);
+                Log.Trace($"TradovateBrokerage.CancelOrder(): Cancelling order {order.Id} (broker ID: {brokerId})");
+
+                var success = _restClient.CancelOrder(brokerId);
+
+                if (success)
+                {
+                    Log.Trace($"TradovateBrokerage.CancelOrder(): Cancel request submitted for order {order.Id}");
+                    // Fire CancelPending event - actual Cancelled status will come via WebSocket
+                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, "Cancel request submitted to Tradovate")
+                    {
+                        Status = OrderStatus.CancelPending
+                    });
+                }
+                else
+                {
+                    Log.Trace($"TradovateBrokerage.CancelOrder(): Cancel request failed for order {order.Id}");
+                }
+
+                return success;
             }
             catch (Exception ex)
             {
@@ -514,8 +536,7 @@ namespace QuantConnect.Brokerages.Tradovate
 
                 _restClient = new TradovateRestApiClient(apiUrl, accessToken);
 
-                // WebSocket is optional for execution-only mode
-                // We can add it later if we need real-time order updates
+                // WebSocket for real-time order updates
                 try
                 {
                     var wsUrl = _environment == TradovateEnvironment.Demo
@@ -525,12 +546,21 @@ namespace QuantConnect.Brokerages.Tradovate
                     _webSocketClient = new TradovateWebSocketClient(wsUrl, accessToken);
                     _webSocketClient.MessageReceived += OnWebSocketMessage;
                     _webSocketClient.ErrorOccurred += OnWebSocketError;
+                    _webSocketClient.OrderUpdateReceived += OnTradovateOrderUpdate;
                     _webSocketClient.Connect();
+
+                    // Subscribe to user events for order notifications
+                    var userId = GetUserId();
+                    if (userId > 0)
+                    {
+                        Log.Trace($"TradovateBrokerage: Subscribing to user events for user ID {userId}");
+                        _webSocketClient.SubscribeUserSync(userId);
+                    }
                 }
                 catch (Exception wsEx)
                 {
-                    // WebSocket is optional, log but continue
-                    Log.Trace($"TradovateBrokerage: WebSocket connection failed (optional): {wsEx.Message}");
+                    // WebSocket is optional for basic operation, log but continue
+                    Log.Trace($"TradovateBrokerage: WebSocket connection failed (order updates will be limited): {wsEx.Message}");
                 }
 
                 OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Information, "Connection", "Successfully connected to Tradovate"));
@@ -577,6 +607,119 @@ namespace QuantConnect.Brokerages.Tradovate
         private void OnWebSocketError(object sender, Exception ex)
         {
             OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "WebSocket", $"WebSocket error: {ex.Message}"));
+        }
+
+        /// <summary>
+        /// Handles order update events from the Tradovate WebSocket
+        /// </summary>
+        private void OnTradovateOrderUpdate(object sender, TradovateOrderUpdate update)
+        {
+            try
+            {
+                Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): {update.EntityType} {update.EventType} - OrderId={update.OrderId}, Status={update.OrdStatus}, FilledQty={update.FilledQty}");
+
+                // Try to find the QC order ID from our mapping
+                if (!_brokerIdToQcOrderId.TryGetValue(update.OrderId, out var qcOrderId))
+                {
+                    Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Unknown broker order ID {update.OrderId}, skipping");
+                    return;
+                }
+
+                // Map Tradovate status to QC status
+                var qcStatus = MapTradovateStatusToQc(update.OrdStatus);
+                if (!qcStatus.HasValue)
+                {
+                    Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Unknown status {update.OrdStatus}, skipping");
+                    return;
+                }
+
+                // Determine fill quantity for this event
+                var fillQuantity = update.FilledQty;
+                var fillPrice = update.AvgFillPrice ?? 0m;
+
+                // Create and fire the order event
+                var direction = update.Action == "Buy" ? OrderDirection.Buy : OrderDirection.Sell;
+                var orderEvent = new OrderEvent(
+                    qcOrderId,
+                    Symbol.Empty,  // Will be filled by transaction handler
+                    DateTime.UtcNow,
+                    qcStatus.Value,
+                    direction,
+                    fillPrice,
+                    fillQuantity,
+                    OrderFee.Zero,
+                    $"Tradovate: {update.OrdStatus}"
+                );
+
+                Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Firing OrderEvent - QC OrderId={qcOrderId}, Status={qcStatus.Value}, FillQty={fillQuantity}, FillPrice={fillPrice}");
+                OnOrderEvent(orderEvent);
+
+                // Clean up mapping if order is terminal
+                if (qcStatus.Value == OrderStatus.Filled || qcStatus.Value == OrderStatus.Canceled || qcStatus.Value == OrderStatus.Invalid)
+                {
+                    _brokerIdToQcOrderId.Remove(update.OrderId);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"TradovateBrokerage.OnTradovateOrderUpdate(): Error processing update: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Maps Tradovate order status to QC OrderStatus
+        /// </summary>
+        private static OrderStatus? MapTradovateStatusToQc(string tradovateStatus)
+        {
+            if (string.IsNullOrEmpty(tradovateStatus))
+                return null;
+
+            switch (tradovateStatus.ToLowerInvariant())
+            {
+                case "working":
+                case "accepted":
+                case "pendingnew":
+                    return OrderStatus.Submitted;
+                case "filled":
+                    return OrderStatus.Filled;
+                case "cancelled":
+                case "canceled":
+                case "expired":
+                    return OrderStatus.Canceled;
+                case "pendingcancel":
+                    return OrderStatus.CancelPending;
+                case "rejected":
+                    return OrderStatus.Invalid;
+                case "partiallyfilled":
+                    return OrderStatus.PartiallyFilled;
+                default:
+                    return null;
+            }
+        }
+
+        /// <summary>
+        /// Gets the user ID from the auth token, caching after first retrieval
+        /// </summary>
+        private int GetUserId()
+        {
+            if (_cachedUserId.HasValue)
+            {
+                return _cachedUserId.Value;
+            }
+
+            // The userId is available from the auth response
+            // For now, we can get it from the accounts endpoint
+            var accounts = _restClient?.GetAccountList();
+            if (accounts == null || accounts.Count == 0)
+            {
+                Log.Error("TradovateBrokerage.GetUserId(): No accounts found");
+                return 0;
+            }
+
+            // UserId is a property on the account
+            _cachedUserId = accounts[0].UserId;
+            Log.Trace($"TradovateBrokerage.GetUserId(): Using user ID {_cachedUserId.Value}");
+            return _cachedUserId.Value;
         }
 
         #endregion
