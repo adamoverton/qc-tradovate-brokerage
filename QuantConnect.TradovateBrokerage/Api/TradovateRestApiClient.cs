@@ -319,6 +319,10 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         public int Id { get; set; }
         public string Name { get; set; }
         public int UserId { get; set; }
+        public bool Active { get; set; }
+        public bool Restricted { get; set; }
+        public bool Closed { get; set; }
+        public bool Archived { get; set; }
     }
 
     public class TradovateCashBalance

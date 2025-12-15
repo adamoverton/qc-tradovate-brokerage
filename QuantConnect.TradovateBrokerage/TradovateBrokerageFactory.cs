@@ -40,6 +40,8 @@ namespace QuantConnect.Brokerages.Tradovate
             { "tradovate-password", Config.Get("tradovate-password") },
             { "tradovate-client-id", Config.Get("tradovate-client-id") },
             { "tradovate-client-secret", Config.Get("tradovate-client-secret") },
+            { "tradovate-oauth-token", Config.Get("tradovate-oauth-token") },
+            { "tradovate-account-name", Config.Get("tradovate-account-name") },
             { "tradovate-environment", Config.Get("environment", "tradovate-demo") }
         };
 
@@ -67,17 +69,30 @@ namespace QuantConnect.Brokerages.Tradovate
         /// <returns>A new brokerage instance</returns>
         public override IBrokerage CreateBrokerage(LiveNodePacket job, IAlgorithm algorithm)
         {
-            var username = Config.Get("tradovate-username");
-            var password = Config.Get("tradovate-password");
-            var clientId = Config.Get("tradovate-client-id");
-            var clientSecret = Config.Get("tradovate-client-secret");
             var environment = Config.Get("environment", "tradovate-demo");
-
             var tradovateEnvironment = environment.Contains("live")
                 ? TradovateEnvironment.Live
                 : TradovateEnvironment.Demo;
 
-            return new TradovateBrokerage(username, password, clientId, clientSecret, tradovateEnvironment);
+            // Optional account name to select specific trading account
+            var accountName = Config.Get("tradovate-account-name");
+
+            // Check if OAuth token is provided (preferred for QC Cloud)
+            var oauthToken = Config.Get("tradovate-oauth-token");
+            if (!string.IsNullOrEmpty(oauthToken))
+            {
+                Logging.Log.Trace("TradovateBrokerageFactory: Using OAuth token authentication");
+                return new TradovateBrokerage(oauthToken, tradovateEnvironment, accountName);
+            }
+
+            // Fall back to username/password authentication
+            var username = Config.Get("tradovate-username");
+            var password = Config.Get("tradovate-password");
+            var clientId = Config.Get("tradovate-client-id");
+            var clientSecret = Config.Get("tradovate-client-secret");
+
+            Logging.Log.Trace("TradovateBrokerageFactory: Using username/password authentication");
+            return new TradovateBrokerage(username, password, clientId, clientSecret, tradovateEnvironment, accountName);
         }
 
         /// <summary>

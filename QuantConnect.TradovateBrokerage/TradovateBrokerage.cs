@@ -39,6 +39,9 @@ namespace QuantConnect.Brokerages.Tradovate
     [BrokerageFactory(typeof(TradovateBrokerageFactory))]
     public class TradovateBrokerage : Brokerage
     {
+        // Increment this when making code changes to verify correct DLL is loaded
+        private const string BrokerageVersion = "2024-12-15-v7-account-selection";
+
         private readonly TradovateSymbolMapper _symbolMapper;
         private TradovateAuthManager _authManager;
         private TradovateRestApiClient _restClient;
@@ -50,6 +53,7 @@ namespace QuantConnect.Brokerages.Tradovate
         private readonly string _oauthToken;
         private readonly TradovateEnvironment _environment;
         private readonly bool _useOAuth;
+        private readonly string _accountName;  // Optional: specific account name to use
         private int? _cachedAccountId;
         private int? _cachedUserId;
         private readonly Dictionary<string, int> _contractIdCache = new Dictionary<string, int>();
@@ -95,11 +99,19 @@ namespace QuantConnect.Brokerages.Tradovate
         /// </summary>
         /// <param name="oauthToken">OAuth access token</param>
         /// <param name="environment">Demo or Live environment</param>
-        public TradovateBrokerage(string oauthToken, TradovateEnvironment environment) : base("TradovateBrokerage")
+        /// <param name="accountName">Optional: specific trading account name to use</param>
+        public TradovateBrokerage(string oauthToken, TradovateEnvironment environment, string accountName = null) : base("TradovateBrokerage")
         {
+            // Log version info at construction to verify correct DLL is loaded
+            var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+            var assemblyDate = System.IO.File.GetLastWriteTime(assembly.Location);
+            Log.Trace($"TradovateBrokerage: Version={BrokerageVersion}, Assembly={assembly.Location}, Modified={assemblyDate:yyyy-MM-dd HH:mm:ss}");
+            Log.Trace($"TradovateBrokerage: Using OAuth token authentication");
+
             _oauthToken = oauthToken;
             _environment = environment;
             _useOAuth = true;
+            _accountName = accountName;
             _symbolMapper = new TradovateSymbolMapper();
         }
 
@@ -111,10 +123,8 @@ namespace QuantConnect.Brokerages.Tradovate
         /// <param name="clientId">Tradovate client ID (appId)</param>
         /// <param name="clientSecret">Tradovate client secret</param>
         /// <param name="environment">Demo or Live environment</param>
-        // Increment this when making code changes to verify correct DLL is loaded
-        private const string BrokerageVersion = "2024-12-15-v5-larger-ws-buffer";
-
-        public TradovateBrokerage(string username, string password, string clientId, string clientSecret, TradovateEnvironment environment) : base("TradovateBrokerage")
+        /// <param name="accountName">Optional: specific trading account name to use</param>
+        public TradovateBrokerage(string username, string password, string clientId, string clientSecret, TradovateEnvironment environment, string accountName = null) : base("TradovateBrokerage")
         {
             // Log version info at construction to verify correct DLL is loaded
             var assembly = System.Reflection.Assembly.GetExecutingAssembly();
@@ -127,6 +137,7 @@ namespace QuantConnect.Brokerages.Tradovate
             _clientSecret = clientSecret;
             _environment = environment;
             _useOAuth = false;
+            _accountName = accountName;
             _symbolMapper = new TradovateSymbolMapper();
         }
 
@@ -390,7 +401,8 @@ namespace QuantConnect.Brokerages.Tradovate
         }
 
         /// <summary>
-        /// Gets the account ID, caching after first retrieval
+        /// Gets the account ID, caching after first retrieval.
+        /// If _accountName is set, selects that specific account; otherwise uses the first active account.
         /// </summary>
         private int GetAccountId()
         {
@@ -406,8 +418,46 @@ namespace QuantConnect.Brokerages.Tradovate
                 return 0;
             }
 
-            _cachedAccountId = accounts[0].Id;
-            Log.Trace($"TradovateBrokerage.GetAccountId(): Using account ID {_cachedAccountId.Value} ({accounts[0].Name})");
+            // Log all available accounts for debugging
+            Log.Trace($"TradovateBrokerage.GetAccountId(): Found {accounts.Count} account(s):");
+            foreach (var acct in accounts)
+            {
+                Log.Trace($"  - {acct.Name} (ID: {acct.Id}, Active: {acct.Active})");
+            }
+
+            TradovateAccount selectedAccount = null;
+
+            // If account name is specified, find it
+            if (!string.IsNullOrEmpty(_accountName))
+            {
+                selectedAccount = accounts.FirstOrDefault(a =>
+                    a.Name.Equals(_accountName, StringComparison.OrdinalIgnoreCase));
+
+                if (selectedAccount == null)
+                {
+                    Log.Error($"TradovateBrokerage.GetAccountId(): Account '{_accountName}' not found. Available: {string.Join(", ", accounts.Select(a => a.Name))}");
+                    return 0;
+                }
+
+                if (!selectedAccount.Active)
+                {
+                    Log.Error($"TradovateBrokerage.GetAccountId(): Account '{_accountName}' is not active");
+                    return 0;
+                }
+            }
+            else
+            {
+                // No account name specified - use first active account
+                selectedAccount = accounts.FirstOrDefault(a => a.Active);
+                if (selectedAccount == null)
+                {
+                    Log.Error("TradovateBrokerage.GetAccountId(): No active accounts found");
+                    return 0;
+                }
+            }
+
+            _cachedAccountId = selectedAccount.Id;
+            Log.Trace($"TradovateBrokerage.GetAccountId(): Selected account '{selectedAccount.Name}' (ID: {_cachedAccountId.Value})");
             return _cachedAccountId.Value;
         }
 
