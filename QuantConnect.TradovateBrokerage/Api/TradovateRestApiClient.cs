@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using QuantConnect.Logging;
 
 namespace QuantConnect.Brokerages.Tradovate.Api
 {
@@ -66,6 +67,38 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             }
         }
 
+        public TradovateCashBalance GetCashBalanceSnapshot(int accountId)
+        {
+            try
+            {
+                return GetCashBalanceSnapshotAsync(accountId).GetAwaiter().GetResult();
+            }
+            catch
+            {
+                return new TradovateCashBalance { TotalCashValue = 0 };
+            }
+        }
+
+        private async Task<TradovateCashBalance> GetCashBalanceSnapshotAsync(int accountId)
+        {
+            try
+            {
+                var response = await _httpClient.GetAsync($"{_apiUrl}/cashBalance/getCashBalanceSnapshot?accountId={accountId}");
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    return JsonConvert.DeserializeObject<TradovateCashBalance>(content) ?? new TradovateCashBalance { TotalCashValue = 0 };
+                }
+
+                return new TradovateCashBalance { TotalCashValue = 0 };
+            }
+            catch
+            {
+                return new TradovateCashBalance { TotalCashValue = 0 };
+            }
+        }
+
         private async Task<List<TradovatePosition>> GetPositionListAsync()
         {
             try
@@ -123,7 +156,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             }
         }
 
-        public int PlaceOrder(TradovateOrder order)
+        public long PlaceOrder(TradovateOrder order)
         {
             if (order == null)
             {
@@ -140,31 +173,43 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             }
         }
 
-        private async Task<int> PlaceOrderAsync(TradovateOrder order)
+        private async Task<long> PlaceOrderAsync(TradovateOrder order)
         {
             try
             {
                 var jsonContent = JsonConvert.SerializeObject(order);
+                Log.Trace($"TradovateRestApiClient.PlaceOrder(): Request JSON: {jsonContent}");
                 var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
                 var response = await _httpClient.PostAsync($"{_apiUrl}/order/placeorder", content);
+                var responseBody = await response.Content.ReadAsStringAsync();
+                Log.Trace($"TradovateRestApiClient.PlaceOrder(): Response: {response.StatusCode} - {responseBody}");
 
                 if (response.IsSuccessStatusCode)
                 {
-                    var responseBody = await response.Content.ReadAsStringAsync();
-                    var jsonResponse = JObject.Parse(responseBody);
-                    return jsonResponse["orderId"]?.Value<int>() ?? 0;
+                    // Parse orderId directly from response string to avoid Newtonsoft.Json Int32 overflow during JObject.Parse
+                    // The orderId can be very large (e.g., 296445350031) which exceeds Int32.MaxValue
+                    var match = System.Text.RegularExpressions.Regex.Match(responseBody, @"""orderId""\s*:\s*(\d+)");
+                    if (match.Success && long.TryParse(match.Groups[1].Value, out var orderId))
+                    {
+                        Log.Trace($"TradovateRestApiClient.PlaceOrder(): Parsed orderId: {orderId}");
+                        return orderId;
+                    }
+                    Log.Error($"TradovateRestApiClient.PlaceOrder(): Failed to parse orderId from response");
+                    return 0;
                 }
 
+                Log.Error($"TradovateRestApiClient.PlaceOrder(): Non-success status: {response.StatusCode} - {responseBody}");
                 return 0;
             }
-            catch
+            catch (Exception ex)
             {
+                Log.Error($"TradovateRestApiClient.PlaceOrder(): Exception: {ex.Message}");
                 return 0;
             }
         }
 
-        public bool CancelOrder(int orderId)
+        public bool CancelOrder(long orderId)
         {
             try
             {
@@ -176,7 +221,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             }
         }
 
-        private async Task<bool> CancelOrderAsync(int orderId)
+        private async Task<bool> CancelOrderAsync(long orderId)
         {
             try
             {
@@ -273,7 +318,19 @@ namespace QuantConnect.Brokerages.Tradovate.Api
     {
         public int Id { get; set; }
         public string Name { get; set; }
-        public decimal Balance { get; set; }
+        public int UserId { get; set; }
+    }
+
+    public class TradovateCashBalance
+    {
+        [JsonProperty("totalCashValue")]
+        public decimal TotalCashValue { get; set; }
+        [JsonProperty("netLiq")]
+        public decimal NetLiq { get; set; }
+        [JsonProperty("realizedPnL")]
+        public decimal RealizedPnL { get; set; }
+        [JsonProperty("openPnL")]
+        public decimal OpenPnL { get; set; }
     }
 
     public class TradovatePosition
@@ -293,10 +350,50 @@ namespace QuantConnect.Brokerages.Tradovate.Api
 
     public class TradovateOrder
     {
+        // Required fields for placing orders
+        [JsonProperty("accountId")]
         public int AccountId { get; set; }
+
+        [JsonProperty("contractId")]
         public int ContractId { get; set; }
-        public string Action { get; set; }
-        public string OrderType { get; set; }
+
+        [JsonProperty("symbol")]
+        public string Symbol { get; set; }  // Required by Tradovate API (e.g., "YMZ5")
+
+        [JsonProperty("action")]
+        public string Action { get; set; }  // "Buy" or "Sell"
+
+        [JsonProperty("orderQty")]
         public int Quantity { get; set; }
+
+        [JsonProperty("orderType")]
+        public string OrderType { get; set; }  // "Market", "Limit", "Stop", "StopLimit"
+
+        // Price fields (used for limit/stop orders)
+        [JsonProperty("price")]
+        public decimal? Price { get; set; }  // Limit price
+
+        [JsonProperty("stopPrice")]
+        public decimal? StopPrice { get; set; }  // Stop trigger price
+
+        // Required for automated trading
+        [JsonProperty("isAutomated")]
+        public bool IsAutomated { get; set; } = true;
+
+        // Response fields (populated when reading orders from API)
+        [JsonProperty("id")]
+        public long Id { get; set; }
+
+        [JsonProperty("ordStatus")]
+        public string OrdStatus { get; set; }  // "Working", "Filled", "Cancelled", "Rejected", etc.
+
+        [JsonProperty("filledQty")]
+        public int FilledQty { get; set; }
+
+        [JsonProperty("avgFillPrice")]
+        public decimal? AvgFillPrice { get; set; }
+
+        [JsonProperty("text")]
+        public string Text { get; set; }  // Error/info message from broker
     }
 }

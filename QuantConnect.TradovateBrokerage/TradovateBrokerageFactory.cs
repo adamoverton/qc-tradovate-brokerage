@@ -13,16 +13,12 @@
  * limitations under the License.
 */
 
-using System;
-using QuantConnect.Packets;
-using QuantConnect.Brokerages;
-using QuantConnect.Interfaces;
-using QuantConnect.Securities;
 using System.Collections.Generic;
-using QuantConnect.Configuration;
-using QuantConnect.Util;
-using QuantConnect.Data;
 using QuantConnect.Brokerages.Tradovate.Api;
+using QuantConnect.Configuration;
+using QuantConnect.Interfaces;
+using QuantConnect.Packets;
+using QuantConnect.Securities;
 
 namespace QuantConnect.Brokerages.Tradovate
 {
@@ -38,7 +34,14 @@ namespace QuantConnect.Brokerages.Tradovate
         /// The implementation of this property will create the brokerage data dictionary required for
         /// running live jobs. See <see cref="IJobQueueHandler.NextJob"/>
         /// </remarks>
-        public override Dictionary<string, string> BrokerageData { get; }
+        public override Dictionary<string, string> BrokerageData => new Dictionary<string, string>
+        {
+            { "tradovate-username", Config.Get("tradovate-username") },
+            { "tradovate-password", Config.Get("tradovate-password") },
+            { "tradovate-client-id", Config.Get("tradovate-client-id") },
+            { "tradovate-client-secret", Config.Get("tradovate-client-secret") },
+            { "tradovate-environment", Config.Get("environment", "tradovate-demo") }
+        };
 
         /// <summary>
         /// Initializes a new instance of the <see cref="TradovateBrokerageFactory"/> class
@@ -74,9 +77,7 @@ namespace QuantConnect.Brokerages.Tradovate
                 ? TradovateEnvironment.Live
                 : TradovateEnvironment.Demo;
 
-            var aggregator = Composer.Instance.GetPart<IDataAggregator>();
-
-            return new TradovateBrokerage(aggregator, username, password, clientId, clientSecret, tradovateEnvironment);
+            return new TradovateBrokerage(username, password, clientId, clientSecret, tradovateEnvironment);
         }
 
         /// <summary>

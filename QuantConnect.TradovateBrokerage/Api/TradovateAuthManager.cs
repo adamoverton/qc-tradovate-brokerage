@@ -88,9 +88,8 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 {
                     name = _username,
                     password = _password,
-                    appId = "QuantConnect LEAN",
+                    appId = "qctest",
                     appVersion = "1.0",
-                    deviceId = "QuantConnect",
                     cid = _clientId,
                     sec = _clientSecret
                 };

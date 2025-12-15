@@ -9,7 +9,8 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
     {
         private const string TestUsername = "test_user";
         private const string TestPassword = "test_password";
-        private const string TestApiKey = "test_api_key";
+        private const string TestClientId = "test_client_id";
+        private const string TestClientSecret = "test_client_secret";
 
         [Test]
         public void Constructor_ValidParameters_CreatesInstance()
@@ -18,7 +19,8 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
             var authManager = new TradovateAuthManager(
                 TestUsername,
                 TestPassword,
-                TestApiKey,
+                TestClientId,
+                TestClientSecret,
                 TradovateEnvironment.Demo
             );
 
@@ -31,7 +33,7 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
         {
             // Arrange, Act & Assert
             Assert.Throws<ArgumentNullException>(() =>
-                new TradovateAuthManager(null, TestPassword, TestApiKey, TradovateEnvironment.Demo)
+                new TradovateAuthManager(null, TestPassword, TestClientId, TestClientSecret, TradovateEnvironment.Demo)
             );
         }
 
@@ -40,16 +42,25 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
         {
             // Arrange, Act & Assert
             Assert.Throws<ArgumentNullException>(() =>
-                new TradovateAuthManager(TestUsername, null, TestApiKey, TradovateEnvironment.Demo)
+                new TradovateAuthManager(TestUsername, null, TestClientId, TestClientSecret, TradovateEnvironment.Demo)
             );
         }
 
         [Test]
-        public void Constructor_NullApiKey_ThrowsArgumentNullException()
+        public void Constructor_NullClientId_ThrowsArgumentNullException()
         {
             // Arrange, Act & Assert
             Assert.Throws<ArgumentNullException>(() =>
-                new TradovateAuthManager(TestUsername, TestPassword, null, TradovateEnvironment.Demo)
+                new TradovateAuthManager(TestUsername, TestPassword, null, TestClientSecret, TradovateEnvironment.Demo)
+            );
+        }
+
+        [Test]
+        public void Constructor_NullClientSecret_ThrowsArgumentNullException()
+        {
+            // Arrange, Act & Assert
+            Assert.Throws<ArgumentNullException>(() =>
+                new TradovateAuthManager(TestUsername, TestPassword, TestClientId, null, TradovateEnvironment.Demo)
             );
         }
 
@@ -60,7 +71,8 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
             var authManager = new TradovateAuthManager(
                 TestUsername,
                 TestPassword,
-                TestApiKey,
+                TestClientId,
+                TestClientSecret,
                 TradovateEnvironment.Demo
             );
 
@@ -78,7 +90,8 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
             var authManager = new TradovateAuthManager(
                 TestUsername,
                 TestPassword,
-                TestApiKey,
+                TestClientId,
+                TestClientSecret,
                 TradovateEnvironment.Demo
             );
 
@@ -96,7 +109,8 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
             var authManager = new TradovateAuthManager(
                 TestUsername,
                 TestPassword,
-                TestApiKey,
+                TestClientId,
+                TestClientSecret,
                 TradovateEnvironment.Demo
             );
 
@@ -114,7 +128,8 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
             var authManager = new TradovateAuthManager(
                 TestUsername,
                 TestPassword,
-                TestApiKey,
+                TestClientId,
+                TestClientSecret,
                 TradovateEnvironment.Live
             );
 
@@ -133,7 +148,8 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
             var authManager = new TradovateAuthManager(
                 TestUsername,
                 TestPassword,
-                TestApiKey,
+                TestClientId,
+                TestClientSecret,
                 TradovateEnvironment.Demo
             );
 
