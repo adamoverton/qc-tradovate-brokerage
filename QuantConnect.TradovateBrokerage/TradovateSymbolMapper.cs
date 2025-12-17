@@ -105,17 +105,57 @@ namespace QuantConnect.Brokerages.Tradovate
                 throw new ArgumentException($"Invalid year digit: {yearDigit}");
             }
 
-            var fullYear = 2020 + year;
+            // Calculate full year using rolling window to handle decade transitions
+            // Start with current decade, adjust if result is too far in the past
+            var currentYear = DateTime.UtcNow.Year;
+            var currentDecade = (currentYear / 10) * 10;
+            var fullYear = currentDecade + year;
 
-            var day = 15;
-            if (_expirationDays.TryGetValue(ticker, out var expirationDay))
+            // If calculated year is more than 5 years in the past, assume next decade
+            if (fullYear < currentYear - 5)
             {
-                day = expirationDay;
+                fullYear += 10;
             }
+
+            var day = GetExpirationDay(ticker);
 
             var contractExpiration = new DateTime(fullYear, month, day);
 
             return Symbol.CreateFuture(ticker, market, contractExpiration);
+        }
+
+        /// <summary>
+        /// Gets the typical expiration day for a futures contract.
+        /// Supports both standard contracts (ES, YM) and micro contracts (MES, MYM).
+        /// </summary>
+        private int GetExpirationDay(string ticker)
+        {
+            // Direct match first (e.g., ES, CL, GC)
+            if (_expirationDays.TryGetValue(ticker, out var day))
+            {
+                return day;
+            }
+
+            // For micro contracts, try matching the suffix (e.g., MES → ES, MYM → YM)
+            // Micro contracts have the same expiration as their parent contracts
+            if (ticker.Length > 2)
+            {
+                var suffix = ticker.Substring(ticker.Length - 2);
+                if (_expirationDays.TryGetValue(suffix, out day))
+                {
+                    return day;
+                }
+
+                // Also try 3-character suffix for contracts like RTY → M2K (MRTY doesn't exist, but pattern holds)
+                var suffix3 = ticker.Substring(ticker.Length - 3);
+                if (_expirationDays.TryGetValue(suffix3, out day))
+                {
+                    return day;
+                }
+            }
+
+            // Default to 15th of the month
+            return 15;
         }
     }
 }

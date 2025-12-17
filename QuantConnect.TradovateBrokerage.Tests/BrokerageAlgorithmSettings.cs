@@ -187,7 +187,7 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
         /// Loads the allowed order types, security types, data types, resolutions and markets
         /// from the provided url of the settings .json file
         /// </summary>
-        public async void LoadConfigs()
+        public void LoadConfigs()
         {
             var json = _url.DownloadData();
             var jObject = JObject.Parse(json);

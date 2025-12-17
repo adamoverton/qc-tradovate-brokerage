@@ -20,6 +20,7 @@ using QuantConnect.Brokerages.Tradovate.Api;
 using QuantConnect.Logging;
 using QuantConnect.Orders;
 using QuantConnect.Orders.Fees;
+using QuantConnect.Orders.TimeInForces;
 using QuantConnect.Securities;
 
 namespace QuantConnect.Brokerages.Tradovate
@@ -39,13 +40,12 @@ namespace QuantConnect.Brokerages.Tradovate
     [BrokerageFactory(typeof(TradovateBrokerageFactory))]
     public class TradovateBrokerage : Brokerage
     {
-        // Increment this when making code changes to verify correct DLL is loaded
-        private const string BrokerageVersion = "2024-12-15-v7-account-selection";
-
         private readonly TradovateSymbolMapper _symbolMapper;
         private TradovateAuthManager _authManager;
         private TradovateRestApiClient _restClient;
         private TradovateWebSocketClient _webSocketClient;
+        private DefaultConnectionHandler _connectionHandler;
+        private readonly object _reconnectLock = new object();
         private readonly string _username;
         private readonly string _password;
         private readonly string _clientId;
@@ -58,6 +58,7 @@ namespace QuantConnect.Brokerages.Tradovate
         private int? _cachedUserId;
         private readonly Dictionary<string, int> _contractIdCache = new Dictionary<string, int>();
         private readonly Dictionary<long, int> _brokerIdToQcOrderId = new Dictionary<long, int>();  // Maps Tradovate orderId to QC orderId
+        private readonly Dictionary<long, int> _cumulativeFillQuantity = new Dictionary<long, int>();  // Tracks cumulative fills per broker order ID
 
         /// <summary>
         /// Returns true if we're currently connected to the broker
@@ -102,11 +103,7 @@ namespace QuantConnect.Brokerages.Tradovate
         /// <param name="accountName">Optional: specific trading account name to use</param>
         public TradovateBrokerage(string oauthToken, TradovateEnvironment environment, string accountName = null) : base("TradovateBrokerage")
         {
-            // Log version info at construction to verify correct DLL is loaded
-            var assembly = System.Reflection.Assembly.GetExecutingAssembly();
-            var assemblyDate = System.IO.File.GetLastWriteTime(assembly.Location);
-            Log.Trace($"TradovateBrokerage: Version={BrokerageVersion}, Assembly={assembly.Location}, Modified={assemblyDate:yyyy-MM-dd HH:mm:ss}");
-            Log.Trace($"TradovateBrokerage: Using OAuth token authentication");
+            Log.Trace("TradovateBrokerage: Initializing with OAuth token authentication");
 
             _oauthToken = oauthToken;
             _environment = environment;
@@ -126,10 +123,7 @@ namespace QuantConnect.Brokerages.Tradovate
         /// <param name="accountName">Optional: specific trading account name to use</param>
         public TradovateBrokerage(string username, string password, string clientId, string clientSecret, TradovateEnvironment environment, string accountName = null) : base("TradovateBrokerage")
         {
-            // Log version info at construction to verify correct DLL is loaded
-            var assembly = System.Reflection.Assembly.GetExecutingAssembly();
-            var assemblyDate = System.IO.File.GetLastWriteTime(assembly.Location);
-            Log.Trace($"TradovateBrokerage: Version={BrokerageVersion}, Assembly={assembly.Location}, Modified={assemblyDate:yyyy-MM-dd HH:mm:ss}");
+            Log.Trace("TradovateBrokerage: Initializing with client credentials authentication");
 
             _username = username;
             _password = password;
@@ -225,7 +219,8 @@ namespace QuantConnect.Brokerages.Tradovate
             }
 
             // Tradovate order statuses that indicate an open order
-            var openStatuses = new[] { "Working", "Accepted", "PendingNew", "PendingCancel", "PendingReplace" };
+            // Suspended = order temporarily paused (e.g., trading halt, risk limit)
+            var openStatuses = new[] { "Working", "Accepted", "PendingNew", "PendingCancel", "PendingReplace", "Suspended" };
             return openStatuses.Contains(ordStatus, StringComparer.OrdinalIgnoreCase);
         }
 
@@ -275,9 +270,62 @@ namespace QuantConnect.Brokerages.Tradovate
         /// <returns>The current holdings from the account</returns>
         public override List<Holding> GetAccountHoldings()
         {
-            // For now, return empty list since we don't have proper symbol mapping yet
-            // TODO: Map Tradovate contract IDs to QuantConnect symbols
-            return new List<Holding>();
+            if (_restClient == null)
+            {
+                return new List<Holding>();
+            }
+
+            try
+            {
+                var positions = _restClient.GetPositionList();
+                var holdings = new List<Holding>();
+
+                foreach (var position in positions)
+                {
+                    // Skip flat positions
+                    if (position.NetPos == 0)
+                    {
+                        continue;
+                    }
+
+                    // Look up contract to get symbol
+                    var contract = _restClient.GetContractById(position.ContractId);
+                    if (contract == null)
+                    {
+                        Log.Trace($"TradovateBrokerage.GetAccountHoldings(): WARNING - Could not find contract {position.ContractId}");
+                        continue;
+                    }
+
+                    // Convert brokerage symbol to QC symbol
+                    Symbol qcSymbol;
+                    try
+                    {
+                        qcSymbol = _symbolMapper.GetLeanSymbol(contract.Name, SecurityType.Future, Market.CME);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Trace($"TradovateBrokerage.GetAccountHoldings(): WARNING - Could not map symbol {contract.Name}: {ex.Message}");
+                        continue;
+                    }
+
+                    holdings.Add(new Holding
+                    {
+                        Symbol = qcSymbol,
+                        Quantity = position.NetPos,
+                        AveragePrice = 0,  // Not reliably available from Tradovate API
+                        MarketPrice = 0,   // Execution-only brokerage, no market data
+                        CurrencySymbol = "USD"
+                    });
+                }
+
+                Log.Trace($"TradovateBrokerage.GetAccountHoldings(): Found {holdings.Count} position(s)");
+                return holdings;
+            }
+            catch (Exception ex)
+            {
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "GetAccountHoldings", $"Error getting holdings: {ex.Message}"));
+                return new List<Holding>();
+            }
         }
 
         /// <summary>
@@ -355,10 +403,17 @@ namespace QuantConnect.Brokerages.Tradovate
                 };
 
                 // Set price fields based on order type
+                // Note: TrailingStopOrder inherits from StopMarketOrder, so check it first
                 switch (order)
                 {
                     case LimitOrder limitOrder:
                         tradovateOrder.Price = limitOrder.LimitPrice;
+                        break;
+                    case TrailingStopOrder trailingOrder:
+                        // Tradovate handles trailing logic server-side
+                        // We just need to set the initial stop price
+                        tradovateOrder.StopPrice = trailingOrder.StopPrice;
+                        Log.Trace($"TradovateBrokerage.PlaceOrder(): Trailing stop - Amount={trailingOrder.TrailingAmount}, AsPercentage={trailingOrder.TrailingAsPercentage}");
                         break;
                     case StopMarketOrder stopOrder:
                         tradovateOrder.StopPrice = stopOrder.StopPrice;
@@ -496,6 +551,9 @@ namespace QuantConnect.Brokerages.Tradovate
                     return "Market";
                 case LimitOrder _:
                     return "Limit";
+                // TrailingStopOrder must be checked BEFORE StopMarketOrder since it inherits from it
+                case TrailingStopOrder _:
+                    return "TrailingStop";
                 case StopMarketOrder _:
                     return "Stop";
                 case StopLimitOrder _:
@@ -506,14 +564,104 @@ namespace QuantConnect.Brokerages.Tradovate
         }
 
         /// <summary>
-        /// Updates the order with the same id
+        /// Updates the order with the same id.
+        /// Tradovate supports modifying quantity, limit price, and stop price.
+        /// IMPORTANT: TimeInForce must match the existing order's setting.
         /// </summary>
         /// <param name="order">The new order information</param>
         /// <returns>True if the request was made for the order to be updated, false otherwise</returns>
         public override bool UpdateOrder(Order order)
         {
-            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "UpdateOrder", "Order updates not supported by Tradovate. Cancel and replace instead."));
-            return false;
+            if (_restClient == null)
+            {
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "UpdateOrder", "REST client not initialized"));
+                return false;
+            }
+
+            if (order.BrokerId == null || !order.BrokerId.Any())
+            {
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "UpdateOrder", "Order has no broker ID - cannot modify"));
+                return false;
+            }
+
+            try
+            {
+                var brokerId = long.Parse(order.BrokerId.First());
+                Log.Trace($"TradovateBrokerage.UpdateOrder(): Modifying order {order.Id} (broker ID: {brokerId})");
+
+                // Build the modification request
+                var modifyRequest = new ModifyOrderRequest
+                {
+                    OrderId = brokerId,
+                    OrderQty = Math.Abs((int)order.Quantity),
+                    OrderType = MapOrderType(order),
+                    IsAutomated = true,
+                    // Default to GTC - in production, should track original TIF
+                    TimeInForce = MapTimeInForce(order.TimeInForce)
+                };
+
+                // Set price fields based on order type
+                switch (order)
+                {
+                    case LimitOrder limitOrder:
+                        modifyRequest.Price = limitOrder.LimitPrice;
+                        break;
+                    case StopMarketOrder stopOrder:
+                        modifyRequest.StopPrice = stopOrder.StopPrice;
+                        break;
+                    case StopLimitOrder stopLimitOrder:
+                        modifyRequest.Price = stopLimitOrder.LimitPrice;
+                        modifyRequest.StopPrice = stopLimitOrder.StopPrice;
+                        break;
+                }
+
+                Log.Trace($"TradovateBrokerage.UpdateOrder(): Sending modify request - OrderId={modifyRequest.OrderId}, Qty={modifyRequest.OrderQty}, Type={modifyRequest.OrderType}, Price={modifyRequest.Price}, StopPrice={modifyRequest.StopPrice}");
+
+                var success = _restClient.ModifyOrder(modifyRequest);
+
+                if (success)
+                {
+                    Log.Trace($"TradovateBrokerage.UpdateOrder(): Modify request submitted for order {order.Id}");
+                    // Fire UpdateSubmitted event - actual Updated status will come via WebSocket
+                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, "Modify request submitted to Tradovate")
+                    {
+                        Status = OrderStatus.UpdateSubmitted
+                    });
+                }
+                else
+                {
+                    Log.Trace($"TradovateBrokerage.UpdateOrder(): Modify request failed for order {order.Id}");
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "UpdateOrder", $"Failed to modify order {order.Id}"));
+                }
+
+                return success;
+            }
+            catch (Exception ex)
+            {
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "UpdateOrder", $"Error modifying order: {ex.Message}"));
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Maps QC TimeInForce to Tradovate string
+        /// </summary>
+        private static string MapTimeInForce(TimeInForce timeInForce)
+        {
+            if (timeInForce == null)
+            {
+                return "GTC";
+            }
+
+            switch (timeInForce)
+            {
+                case DayTimeInForce _:
+                    return "Day";
+                case GoodTilCanceledTimeInForce _:
+                    return "GTC";
+                default:
+                    return "GTC";
+            }
         }
 
         /// <summary>
@@ -560,6 +708,129 @@ namespace QuantConnect.Brokerages.Tradovate
         }
 
         /// <summary>
+
+        /// <summary>
+        /// Places a native Tradovate bracket order (entry with stop loss and take profit)
+        /// </summary>
+        /// <param name="symbol">The Tradovate contract symbol (e.g., "YMH6")</param>
+        /// <param name="action">Buy or Sell</param>
+        /// <param name="quantity">Order quantity</param>
+        /// <param name="entryType">Entry order type: "Market", "Limit", "Stop", "StopLimit"</param>
+        /// <param name="entryPrice">Entry limit price (for Limit/StopLimit orders)</param>
+        /// <param name="profitTargetTicks">Take profit in ticks from entry (positive)</param>
+        /// <param name="stopLossTicks">Stop loss in ticks from entry (positive, will be negated internally)</param>
+        /// <param name="timeInForce">GTC or Day (default GTC)</param>
+        /// <returns>Order strategy ID if successful, 0 otherwise</returns>
+        public long PlaceBracketOrder(
+            string symbol,
+            string action,
+            int quantity,
+            string entryType,
+            decimal? entryPrice,
+            decimal profitTargetTicks,
+            decimal stopLossTicks,
+            string timeInForce = "GTC")
+        {
+            if (_restClient == null)
+            {
+                Log.Error("TradovateBrokerage.PlaceBracketOrder(): REST client not initialized");
+                return 0;
+            }
+
+            try
+            {
+                var accountId = GetAccountId();
+                if (accountId == 0)
+                {
+                    Log.Error("TradovateBrokerage.PlaceBracketOrder(): Could not get account ID");
+                    return 0;
+                }
+
+                // Build bracket parameters
+                // Tradovate API formula: price = entry + offset
+                // For BUY: profit is above entry (positive offset), stop is below entry (negative offset)
+                // For SELL: profit is below entry (negative offset), stop is above entry (positive offset)
+                decimal profitTargetOffset, stopLossOffset;
+                if (action == "Buy")
+                {
+                    profitTargetOffset = Math.Abs(profitTargetTicks);   // Positive for above entry
+                    stopLossOffset = -Math.Abs(stopLossTicks);          // Negative for below entry
+                }
+                else // Sell
+                {
+                    profitTargetOffset = -Math.Abs(profitTargetTicks);  // Negative for below entry
+                    stopLossOffset = Math.Abs(stopLossTicks);           // Positive for above entry
+                }
+
+                var bracketParams = new BracketOrderParams
+                {
+                    EntryVersion = new BracketEntryVersion
+                    {
+                        OrderQty = quantity,
+                        OrderType = entryType,
+                        TimeInForce = timeInForce,
+                        Price = entryType == "Limit" || entryType == "StopLimit" ? entryPrice : null,
+                        StopPrice = entryType == "Stop" || entryType == "StopLimit" ? entryPrice : null
+                    },
+                    Brackets = new List<BracketExit>
+                    {
+                        new BracketExit
+                        {
+                            Qty = quantity,
+                            ProfitTarget = profitTargetOffset,
+                            StopLoss = stopLossOffset,
+                            TrailingStop = false
+                        }
+                    }
+                };
+
+                var request = new StartOrderStrategyRequest
+                {
+                    AccountId = accountId,
+                    AccountSpec = _accountName ?? string.Format("DEMO{0}", accountId),
+                    Symbol = symbol,
+                    Action = action,
+                    OrderStrategyTypeId = 2,
+                    Params = Newtonsoft.Json.JsonConvert.SerializeObject(bracketParams)
+                };
+
+                Log.Trace(string.Format("TradovateBrokerage.PlaceBracketOrder(): Placing bracket order - {0} {1} {2} @ {3} {4}, PT={5}, SL={6}", action, quantity, symbol, entryType, entryPrice, profitTargetOffset, stopLossOffset));
+
+                var strategyId = _restClient.StartOrderStrategy(request);
+
+                if (strategyId > 0)
+                {
+                    Log.Trace(string.Format("TradovateBrokerage.PlaceBracketOrder(): Bracket order placed, strategy ID: {0}", strategyId));
+                }
+                else
+                {
+                    Log.Error("TradovateBrokerage.PlaceBracketOrder(): Failed to place bracket order");
+                }
+
+                return strategyId;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(string.Format("TradovateBrokerage.PlaceBracketOrder(): Exception: {0}", ex.Message));
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Cancels a bracket order strategy
+        /// </summary>
+        /// <param name="orderStrategyId">The order strategy ID to cancel</param>
+        /// <returns>True if cancellation request succeeded</returns>
+        public bool CancelBracketOrder(long orderStrategyId)
+        {
+            if (_restClient == null)
+            {
+                Log.Error("TradovateBrokerage.CancelBracketOrder(): REST client not initialized");
+                return false;
+            }
+
+            return _restClient.CancelOrderStrategy(orderStrategyId);
+        }
         /// Connects the client to the broker's remote servers
         /// </summary>
         public override void Connect()
@@ -606,12 +877,31 @@ namespace QuantConnect.Brokerages.Tradovate
                         Log.Trace($"TradovateBrokerage: Subscribing to user events for user ID {userId}");
                         _webSocketClient.SubscribeUserSync(userId);
                     }
+
+                    // Initialize connection handler for automatic reconnection
+                    _connectionHandler = new DefaultConnectionHandler();
+                    _connectionHandler.MaximumIdleTimeSpan = TimeSpan.FromSeconds(5);  // Allow 2 missed heartbeats (2.5s interval)
+                    _connectionHandler.ReconnectRequested += OnReconnectRequested;
+                    _connectionHandler.ConnectionLost += (s, e) => OnMessage(new BrokerageMessageEvent(
+                        BrokerageMessageType.Warning, "WebSocket", "Connection lost - attempting to reconnect"));
+                    _connectionHandler.ConnectionRestored += (s, e) => OnMessage(new BrokerageMessageEvent(
+                        BrokerageMessageType.Information, "WebSocket", "Connection restored"));
+                    _connectionHandler.Initialize("TradovateWebSocket");
+                    _connectionHandler.EnableMonitoring(true);
+                    Log.Trace("TradovateBrokerage: WebSocket connection monitoring enabled");
                 }
                 catch (Exception wsEx)
                 {
                     // WebSocket is optional for basic operation, log but continue
                     Log.Trace($"TradovateBrokerage: WebSocket connection failed (order updates will be limited): {wsEx.Message}");
                 }
+
+                // Subscribe to token refresh events to update REST and WebSocket clients
+                _authManager.TokenRefreshed += OnTokenRefreshed;
+
+                // Start automatic token refresh timer
+                _authManager.StartAutoRefresh();
+                Log.Trace("TradovateBrokerage: Token auto-refresh enabled");
 
                 OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Information, "Connection", "Successfully connected to Tradovate"));
             }
@@ -622,14 +912,64 @@ namespace QuantConnect.Brokerages.Tradovate
         }
 
         /// <summary>
+        /// Handles token refresh events from the auth manager
+        /// </summary>
+        private void OnTokenRefreshed(object sender, TokenRefreshedEventArgs e)
+        {
+            try
+            {
+                Log.Trace($"TradovateBrokerage.OnTokenRefreshed(): Updating clients with new token (expires {e.Expiration:yyyy-MM-dd HH:mm:ss} UTC)");
+
+                // Update REST client
+                _restClient?.UpdateAccessToken(e.NewAccessToken);
+
+                // Update WebSocket client (will re-authenticate)
+                _webSocketClient?.UpdateAccessToken(e.NewAccessToken);
+
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Information, "TokenRefresh", "Access token refreshed successfully"));
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"TradovateBrokerage.OnTokenRefreshed(): Failed to update clients: {ex.Message}");
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "TokenRefresh", $"Token refresh error: {ex.Message}"));
+            }
+        }
+
+        /// <summary>
         /// Disconnects the client from the broker's remote servers
         /// </summary>
         public override void Disconnect()
         {
             try
             {
-                _webSocketClient?.Disconnect();
-                _webSocketClient?.Dispose();
+                // Stop connection monitoring
+                if (_connectionHandler != null)
+                {
+                    _connectionHandler.ReconnectRequested -= OnReconnectRequested;
+                    _connectionHandler.EnableMonitoring(false);
+                    _connectionHandler.Dispose();
+                    _connectionHandler = null;
+                }
+
+                // Stop token auto-refresh and unsubscribe from events
+                if (_authManager != null)
+                {
+                    _authManager.TokenRefreshed -= OnTokenRefreshed;
+                    _authManager.StopAutoRefresh();
+                    _authManager.Dispose();
+                    _authManager = null;
+                }
+
+                if (_webSocketClient != null)
+                {
+                    _webSocketClient.MessageReceived -= OnWebSocketMessage;
+                    _webSocketClient.ErrorOccurred -= OnWebSocketError;
+                    _webSocketClient.OrderUpdateReceived -= OnTradovateOrderUpdate;
+                    _webSocketClient.Disconnect();
+                    _webSocketClient.Dispose();
+                    _webSocketClient = null;
+                }
+
                 OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Information, "Disconnect", "Disconnected from Tradovate"));
             }
             catch (Exception ex)
@@ -646,6 +986,9 @@ namespace QuantConnect.Brokerages.Tradovate
         {
             try
             {
+                // Notify connection handler that we received data (keeps connection alive)
+                _connectionHandler?.KeepAlive(DateTime.UtcNow);
+
                 Log.Trace($"TradovateBrokerage.OnWebSocketMessage(): {message}");
             }
             catch (Exception ex)
@@ -657,6 +1000,64 @@ namespace QuantConnect.Brokerages.Tradovate
         private void OnWebSocketError(object sender, Exception ex)
         {
             OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "WebSocket", $"WebSocket error: {ex.Message}"));
+        }
+
+        /// <summary>
+        /// Handles reconnection requests from the connection handler
+        /// </summary>
+        private void OnReconnectRequested(object sender, EventArgs e)
+        {
+            lock (_reconnectLock)
+            {
+                try
+                {
+                    Log.Trace("TradovateBrokerage.OnReconnectRequested(): Attempting WebSocket reconnection");
+
+                    // Disconnect existing WebSocket
+                    if (_webSocketClient != null)
+                    {
+                        _webSocketClient.MessageReceived -= OnWebSocketMessage;
+                        _webSocketClient.ErrorOccurred -= OnWebSocketError;
+                        _webSocketClient.OrderUpdateReceived -= OnTradovateOrderUpdate;
+                        _webSocketClient.Disconnect();
+                        _webSocketClient.Dispose();
+                        _webSocketClient = null;
+                    }
+
+                    // Ensure we have a valid token
+                    if (_authManager == null || !_authManager.IsAuthenticated)
+                    {
+                        Log.Error("TradovateBrokerage.OnReconnectRequested(): Auth manager not available or not authenticated");
+                        return;
+                    }
+
+                    var accessToken = _authManager.GetAccessToken();
+                    var wsUrl = _environment == TradovateEnvironment.Demo
+                        ? "wss://demo.tradovateapi.com/v1/websocket"
+                        : "wss://live.tradovateapi.com/v1/websocket";
+
+                    // Create new WebSocket client
+                    _webSocketClient = new TradovateWebSocketClient(wsUrl, accessToken);
+                    _webSocketClient.MessageReceived += OnWebSocketMessage;
+                    _webSocketClient.ErrorOccurred += OnWebSocketError;
+                    _webSocketClient.OrderUpdateReceived += OnTradovateOrderUpdate;
+                    _webSocketClient.Connect();
+
+                    // Re-subscribe to user events
+                    var userId = GetUserId();
+                    if (userId > 0)
+                    {
+                        Log.Trace($"TradovateBrokerage.OnReconnectRequested(): Re-subscribing to user events for user ID {userId}");
+                        _webSocketClient.SubscribeUserSync(userId);
+                    }
+
+                    Log.Trace("TradovateBrokerage.OnReconnectRequested(): WebSocket reconnected successfully");
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"TradovateBrokerage.OnReconnectRequested(): Reconnection failed: {ex.Message}");
+                }
+            }
         }
 
         /// <summary>
@@ -684,8 +1085,21 @@ namespace QuantConnect.Brokerages.Tradovate
                 }
 
                 // Determine fill quantity for this event
-                var fillQuantity = update.FilledQty;
+                // Tradovate sends cumulative FilledQty, but LEAN expects incremental fill per event
+                // Calculate the delta from previous cumulative fill
+                var previousCumulativeFill = _cumulativeFillQuantity.GetValueOrDefault(update.OrderId, 0);
+                var currentCumulativeFill = update.FilledQty;
+                var fillQuantity = currentCumulativeFill - previousCumulativeFill;
+
+                // Update tracking with current cumulative fill
+                if (currentCumulativeFill > 0)
+                {
+                    _cumulativeFillQuantity[update.OrderId] = currentCumulativeFill;
+                }
+
                 var fillPrice = update.AvgFillPrice ?? 0m;
+
+                Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Fill calculation - Previous={previousCumulativeFill}, Current={currentCumulativeFill}, Incremental={fillQuantity}");
 
                 // Create and fire the order event
                 var direction = update.Action == "Buy" ? OrderDirection.Buy : OrderDirection.Sell;
@@ -704,10 +1118,11 @@ namespace QuantConnect.Brokerages.Tradovate
                 Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Firing OrderEvent - QC OrderId={qcOrderId}, Status={qcStatus.Value}, FillQty={fillQuantity}, FillPrice={fillPrice}");
                 OnOrderEvent(orderEvent);
 
-                // Clean up mapping if order is terminal
+                // Clean up mappings if order is terminal
                 if (qcStatus.Value == OrderStatus.Filled || qcStatus.Value == OrderStatus.Canceled || qcStatus.Value == OrderStatus.Invalid)
                 {
                     _brokerIdToQcOrderId.Remove(update.OrderId);
+                    _cumulativeFillQuantity.Remove(update.OrderId);
                 }
             }
             catch (Exception ex)
@@ -729,6 +1144,7 @@ namespace QuantConnect.Brokerages.Tradovate
                 case "working":
                 case "accepted":
                 case "pendingnew":
+                case "suspended":  // Order temporarily paused but still open
                     return OrderStatus.Submitted;
                 case "filled":
                     return OrderStatus.Filled;
@@ -738,6 +1154,8 @@ namespace QuantConnect.Brokerages.Tradovate
                     return OrderStatus.Canceled;
                 case "pendingcancel":
                     return OrderStatus.CancelPending;
+                case "pendingreplace":
+                    return OrderStatus.UpdateSubmitted;
                 case "rejected":
                     return OrderStatus.Invalid;
                 case "partiallyfilled":

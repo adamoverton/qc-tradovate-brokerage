@@ -33,14 +33,19 @@ namespace QuantConnect.Brokerages.Tradovate.Api
     public class TradovateWebSocketClient : IDisposable
     {
         private readonly string _url;
-        private readonly string _accessToken;
+        private string _accessToken;
         private ClientWebSocket _webSocket;
         private CancellationTokenSource _cancellationTokenSource;
         private Task _receiveTask;
+        private Task _heartbeatTask;
         private bool _isConnected;
         private bool _isAuthenticated;
         private int _requestId = 1;
         private TaskCompletionSource<bool> _authenticationCompletionSource;
+        private readonly object _tokenLock = new object();
+
+        // Heartbeat interval - Tradovate requires heartbeat every ~2.5 seconds
+        private const int HeartbeatIntervalMs = 2000;
 
         public event EventHandler<string> MessageReceived;
         public event EventHandler<Exception> ErrorOccurred;
@@ -53,6 +58,49 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         {
             _url = url ?? throw new ArgumentNullException(nameof(url));
             _accessToken = accessToken ?? throw new ArgumentNullException(nameof(accessToken));
+        }
+
+        /// <summary>
+        /// Updates the access token and re-authenticates the WebSocket connection.
+        /// Called when the token is refreshed by TradovateAuthManager.
+        /// </summary>
+        /// <param name="newAccessToken">The new access token</param>
+        /// <returns>True if re-authentication succeeded, false otherwise</returns>
+        public bool UpdateAccessToken(string newAccessToken)
+        {
+            if (string.IsNullOrEmpty(newAccessToken))
+            {
+                return false;
+            }
+
+            lock (_tokenLock)
+            {
+                _accessToken = newAccessToken;
+            }
+
+            // Re-authenticate with the new token if connected
+            if (_isConnected && _webSocket?.State == WebSocketState.Open)
+            {
+                try
+                {
+                    ReauthenticateAsync(newAccessToken).GetAwaiter().GetResult();
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            return true; // Token updated, will be used on next connection
+        }
+
+        private async Task ReauthenticateAsync(string token)
+        {
+            // Send a new authorize message with the refreshed token
+            var authMessage = $"authorize\n{_requestId++}\n\n{token}";
+            await SendAsync(authMessage);
+            // Note: We don't wait for response here - the existing message handler will process it
         }
 
         public void Connect()
@@ -81,6 +129,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 _isAuthenticated = false;
 
                 _receiveTask = Task.Run(ReceiveLoop, _cancellationTokenSource.Token);
+                _heartbeatTask = Task.Run(HeartbeatLoop, _cancellationTokenSource.Token);
 
                 // Wait for 'o' (open frame) then authenticate
                 await Task.Delay(500); // Give time for open frame
@@ -101,7 +150,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                     throw new Exception("Authentication failed");
                 }
             }
-            catch (Exception ex)
+            catch (Exception)
             {
                 _isConnected = false;
                 OnConnectionStateChanged(false);
@@ -229,8 +278,10 @@ namespace QuantConnect.Brokerages.Tradovate.Api
 
         private async Task ReceiveLoop()
         {
-            // Large buffer for user/syncrequest which can return substantial initial payload
+            // Buffer for individual receive operations
             var buffer = new byte[65536];
+            // StringBuilder to accumulate fragmented messages
+            var messageBuilder = new StringBuilder();
 
             try
             {
@@ -246,8 +297,16 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                         break;
                     }
 
-                    var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    OnMessageReceived(message);
+                    // Accumulate the message fragment
+                    messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+
+                    // Only process the message when we have the complete message
+                    if (result.EndOfMessage)
+                    {
+                        var message = messageBuilder.ToString();
+                        messageBuilder.Clear();
+                        OnMessageReceived(message);
+                    }
                 }
             }
             catch (Exception ex)
@@ -255,6 +314,31 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 _isConnected = false;
                 OnConnectionStateChanged(false);
                 OnError(ex);
+            }
+        }
+
+        private async Task HeartbeatLoop()
+        {
+            try
+            {
+                while (!_cancellationTokenSource.Token.IsCancellationRequested)
+                {
+                    await Task.Delay(HeartbeatIntervalMs, _cancellationTokenSource.Token);
+
+                    if (_webSocket?.State == WebSocketState.Open)
+                    {
+                        // Send empty JSON array as heartbeat per Tradovate documentation
+                        await SendAsync("[]");
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected when cancellation is requested
+            }
+            catch (Exception)
+            {
+                // Heartbeat failure - connection will likely be detected as closed elsewhere
             }
         }
 
@@ -402,6 +486,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             {
                 _cancellationTokenSource?.Cancel();
                 _receiveTask?.Wait(TimeSpan.FromSeconds(5));
+                _heartbeatTask?.Wait(TimeSpan.FromSeconds(2));
                 _webSocket?.Dispose();
                 _cancellationTokenSource?.Dispose();
             }

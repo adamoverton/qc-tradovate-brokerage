@@ -1,41 +1,31 @@
 {
-    "description": "description of brokerage",
+    "name": "Tradovate",
+    "description": "Tradovate is a cloud-based futures trading platform offering commission-free futures trading with low margins. Supports CME, CBOT, NYMEX, COMEX, and NYBOT exchanges.",
     "platforms-features": [
         {
             "Platforms": ["Cloud Platform", "Local Platform", "LEAN CLI"],
-			"Download Data": [0,0,0],
-			"Backtesting": [0,0,0],
-			"Optimization": [0,0,0],
-			"Live Trading":	[0,0,0]
+            "Download Data": [0, 0, 0],
+            "Backtesting": [0, 0, 0],
+            "Optimization": [0, 0, 0],
+            "Live Trading": [1, 1, 1]
         }
     ],
-    "order-types": ["Market", "Limit", "..."],
-	"assets": ["Equity", "Future Options", "..."], 
-	"brokerage-url": "",
-  	"documentation": "link on QuantConnect dock",
-	"module-specification": {
-		"download": {
-			"data-types": [
-				"Trade",
-				"Quote",
-                "OpenInterest"
-			],
-			"resolutions": [
-                "Tick",
-				"Second",
-				"Minute",
-				"Hour",
-				"Daily"
-			],
-			"security-types": [
-				"Equity",
-				"FutureOption",
-                "..."
-			],
-			"markets": [
-				"USA",
-                "..."
-			]
-		}
-	}
+    "order-types": ["Market", "Limit", "Stop Market", "Stop Limit"],
+    "assets": ["Futures"],
+    "brokerage-url": "https://www.tradovate.com/",
+    "documentation": "/docs/v2/cloud-platform/live-trading/brokerages/tradovate",
+    "module-specification": {
+        "live-trading": {
+            "security-types": [
+                "Future"
+            ],
+            "markets": [
+                "CME",
+                "CBOT",
+                "NYMEX",
+                "COMEX",
+                "NYBOT"
+            ]
+        }
+    }
 }
