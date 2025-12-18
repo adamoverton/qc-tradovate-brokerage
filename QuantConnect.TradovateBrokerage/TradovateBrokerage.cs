@@ -33,8 +33,13 @@ namespace QuantConnect.Brokerages.Tradovate
     /// For live trading, use a separate data source (IQFeed, Databento, QC Cloud, etc.)
     /// alongside this brokerage for execution.
     ///
-    /// Reason: CME requires a sub-vendor license (~$290-375/month per exchange) for API
-    /// market data access. Since Tradovate is popular with budget-conscious prop firm traders,
+    /// Authentication:
+    /// - Local/Docker: Use OAuth token from Tradovate Authorization Code flow, or API Key credentials
+    /// - QC Cloud: TradovateAccessTokenMetaDataRequest/Response classes are provided for
+    ///   OAuthTokenHandler integration (requires QuantConnect to configure Auth0 for Tradovate)
+    ///
+    /// Reason for execution-only: CME requires a sub-vendor license (~$290-375/month per exchange)
+    /// for API market data access. Since Tradovate is popular with budget-conscious prop firm traders,
     /// this cost is prohibitive for most users. See reference/market-data.md for details.
     /// </summary>
     [BrokerageFactory(typeof(TradovateBrokerageFactory))]

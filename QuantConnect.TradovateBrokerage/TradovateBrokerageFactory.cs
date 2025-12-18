@@ -23,7 +23,15 @@ using QuantConnect.Securities;
 namespace QuantConnect.Brokerages.Tradovate
 {
     /// <summary>
-    /// Provides factory for Tradovate brokerage
+    /// Provides factory for Tradovate brokerage.
+    ///
+    /// Authentication modes:
+    /// 1. OAuth Token (Local/Docker): Set tradovate-oauth-token in config. Token obtained via
+    ///    OAuth Authorization Code flow, then passed directly. Use TradovateAuthManager for renewal.
+    /// 2. Username/Password (API Key mode): Set tradovate-username, tradovate-password,
+    ///    tradovate-client-id, tradovate-client-secret. Requires $25/mo Tradovate API access.
+    /// 3. QC Cloud OAuth (Future): TradovateAccessTokenMetaDataRequest/Response classes are ready
+    ///    for OAuthTokenHandler integration. Requires QuantConnect to add Tradovate to Auth0.
     /// </summary>
     public class TradovateBrokerageFactory : BrokerageFactory
     {
