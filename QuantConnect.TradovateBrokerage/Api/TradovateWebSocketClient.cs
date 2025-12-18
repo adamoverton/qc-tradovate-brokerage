@@ -357,7 +357,8 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                     break;
 
                 case 'h': // Heartbeat frame - keep alive
-                    // Do nothing, connection is alive
+                    // Fire MessageReceived so connection handler knows we're alive
+                    MessageReceived?.Invoke(this, "heartbeat");
                     break;
 
                 case 'a': // Array frame - actual data
