@@ -525,6 +525,12 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         public decimal RealizedPnL { get; set; }
         [JsonProperty("openPnL")]
         public decimal OpenPnL { get; set; }
+
+        /// <summary>
+        /// Error text if the API request failed (e.g., invalid account)
+        /// </summary>
+        [JsonProperty("errorText")]
+        public string ErrorText { get; set; }
     }
 
     public class TradovatePosition
@@ -533,6 +539,12 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         public int AccountId { get; set; }
         public int ContractId { get; set; }
         public int NetPos { get; set; }
+
+        /// <summary>
+        /// Average price of the current position (from Tradovate API)
+        /// </summary>
+        [JsonProperty("netPrice")]
+        public decimal? NetPrice { get; set; }
     }
 
     public class TradovateContract

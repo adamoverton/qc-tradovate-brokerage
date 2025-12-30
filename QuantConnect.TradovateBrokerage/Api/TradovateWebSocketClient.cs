@@ -17,8 +17,8 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         public string EventType { get; set; }      // Created, Updated, Deleted
         public string EntityType { get; set; }     // order, executionReport, fill
         public long OrderId { get; set; }
-        public int AccountId { get; set; }
-        public int ContractId { get; set; }
+        public long AccountId { get; set; }
+        public long ContractId { get; set; }
         public string OrdStatus { get; set; }      // Working, Filled, Cancelled, Rejected
         public string Action { get; set; }         // Buy, Sell
         public string OrderType { get; set; }      // Market, Limit, Stop, StopLimit
@@ -28,6 +28,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         public decimal? StopPrice { get; set; }
         public decimal? AvgFillPrice { get; set; }
         public string Text { get; set; }           // Error/info message
+        public DateTime? Timestamp { get; set; }   // Event timestamp from Tradovate
     }
 
     public class TradovateWebSocketClient : IDisposable
@@ -444,22 +445,32 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 // Process order-related events
                 if (entityType == "order" || entityType == "executionReport")
                 {
+                    // Parse timestamp if available
+                    DateTime? timestamp = null;
+                    var timestampStr = entity["timestamp"]?.ToString();
+                    if (!string.IsNullOrEmpty(timestampStr) && DateTime.TryParse(timestampStr, out var parsedTime))
+                    {
+                        timestamp = parsedTime.ToUniversalTime();
+                    }
+
                     var orderUpdate = new TradovateOrderUpdate
                     {
                         EventType = eventType,
                         EntityType = entityType,
-                        OrderId = entity["id"]?.Value<long>() ?? 0,
-                        AccountId = entity["accountId"]?.Value<int>() ?? 0,
-                        ContractId = entity["contractId"]?.Value<int>() ?? 0,
+                        // For executionReports, orderId links to the parent order; for order entities, use id
+                        OrderId = entity["orderId"]?.Value<long>() ?? entity["id"]?.Value<long>() ?? 0,
+                        AccountId = entity["accountId"]?.Value<long>() ?? 0,
+                        ContractId = entity["contractId"]?.Value<long>() ?? 0,
                         OrdStatus = entity["ordStatus"]?.ToString(),
                         Action = entity["action"]?.ToString(),
                         OrderType = entity["orderType"]?.ToString(),
-                        Qty = entity["qty"]?.Value<int>() ?? entity["orderQty"]?.Value<int>() ?? 0,
-                        FilledQty = entity["filledQty"]?.Value<int>() ?? 0,
+                        Qty = entity["orderQty"]?.Value<int>() ?? 0,
+                        FilledQty = entity["cumQty"]?.Value<int>() ?? 0,
                         Price = entity["price"]?.Value<decimal?>(),
                         StopPrice = entity["stopPrice"]?.Value<decimal?>(),
-                        AvgFillPrice = entity["avgFillPrice"]?.Value<decimal?>(),
-                        Text = entity["text"]?.ToString()
+                        AvgFillPrice = entity["avgPx"]?.Value<decimal?>(),
+                        Text = entity["text"]?.ToString(),
+                        Timestamp = timestamp
                     };
 
                     OrderUpdateReceived?.Invoke(this, orderUpdate);

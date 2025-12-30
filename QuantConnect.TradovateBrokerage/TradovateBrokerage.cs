@@ -63,7 +63,10 @@ namespace QuantConnect.Brokerages.Tradovate
         private int? _cachedUserId;
         private readonly Dictionary<string, int> _contractIdCache = new Dictionary<string, int>();
         private readonly Dictionary<long, int> _brokerIdToQcOrderId = new Dictionary<long, int>();  // Maps Tradovate orderId to QC orderId
+        private readonly Dictionary<long, Symbol> _brokerIdToSymbol = new Dictionary<long, Symbol>();  // Maps Tradovate orderId to QC Symbol
         private readonly Dictionary<long, int> _cumulativeFillQuantity = new Dictionary<long, int>();  // Tracks cumulative fills per broker order ID
+        private readonly Dictionary<long, List<TradovateOrderUpdate>> _pendingOrderUpdates = new Dictionary<long, List<TradovateOrderUpdate>>();  // Queues updates that arrive before order registration
+        private readonly object _orderUpdateLock = new object();  // Lock for order update processing
 
         /// <summary>
         /// Returns true if we're currently connected to the broker
@@ -263,6 +266,15 @@ namespace QuantConnect.Brokerages.Tradovate
                     }
                     return new StopLimitOrder(symbol, quantity, tvOrder.StopPrice.Value, tvOrder.Price.Value, DateTime.UtcNow);
 
+                case "trailingstop":
+                    if (!tvOrder.StopPrice.HasValue)
+                    {
+                        Log.Trace($"TradovateBrokerage.CreateQcOrder(): WARNING - TrailingStop order {tvOrder.Id} missing stop price");
+                        return null;
+                    }
+                    // Note: Tradovate manages the trailing logic server-side; we create with current stop price
+                    return new TrailingStopOrder(symbol, quantity, tvOrder.StopPrice.Value, 0, false, DateTime.UtcNow);
+
                 default:
                     Log.Trace($"TradovateBrokerage.CreateQcOrder(): WARNING - Unknown order type {tvOrder.OrderType}");
                     return null;
@@ -317,7 +329,7 @@ namespace QuantConnect.Brokerages.Tradovate
                     {
                         Symbol = qcSymbol,
                         Quantity = position.NetPos,
-                        AveragePrice = 0,  // Not reliably available from Tradovate API
+                        AveragePrice = position.NetPrice ?? 0,  // Use Tradovate's netPrice if available
                         MarketPrice = 0,   // Execution-only brokerage, no market data
                         CurrencySymbol = "USD"
                     });
@@ -354,6 +366,14 @@ namespace QuantConnect.Brokerages.Tradovate
 
                 var accountId = accounts[0].Id;
                 var cashBalance = _restClient.GetCashBalanceSnapshot(accountId);
+
+                // Check for API error response
+                if (!string.IsNullOrEmpty(cashBalance.ErrorText))
+                {
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "GetCashBalance", $"Tradovate API error: {cashBalance.ErrorText}"));
+                    return new List<CashAmount> { new CashAmount(0, "USD") };
+                }
+
                 return new List<CashAmount> { new CashAmount(cashBalance.TotalCashValue, "USD") };
             }
             catch (Exception ex)
@@ -440,8 +460,13 @@ namespace QuantConnect.Brokerages.Tradovate
                 }
 
                 // Set broker ID on the order and cache the mapping
-                order.BrokerId.Add(tradovateOrderId.ToString());
-                _brokerIdToQcOrderId[tradovateOrderId] = order.Id;
+                // Use lock to synchronize with WebSocket event handler
+                lock (_orderUpdateLock)
+                {
+                    order.BrokerId.Add(tradovateOrderId.ToString());
+                    _brokerIdToQcOrderId[tradovateOrderId] = order.Id;
+                    _brokerIdToSymbol[tradovateOrderId] = order.Symbol;
+                }
 
                 Log.Trace($"TradovateBrokerage.PlaceOrder(): Order {order.Id} placed successfully, broker ID: {tradovateOrderId}");
 
@@ -450,6 +475,10 @@ namespace QuantConnect.Brokerages.Tradovate
                 {
                     Status = OrderStatus.Submitted
                 });
+
+                // Process any WebSocket events that arrived before order was registered
+                // This handles the race condition where executionReport arrives before PlaceOrder returns
+                ProcessPendingOrderUpdates(tradovateOrderId, order.Id);
 
                 return true;
             }
@@ -1074,12 +1103,42 @@ namespace QuantConnect.Brokerages.Tradovate
             {
                 Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): {update.EntityType} {update.EventType} - OrderId={update.OrderId}, Status={update.OrdStatus}, FilledQty={update.FilledQty}");
 
-                // Try to find the QC order ID from our mapping
-                if (!_brokerIdToQcOrderId.TryGetValue(update.OrderId, out var qcOrderId))
+                lock (_orderUpdateLock)
                 {
-                    Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Unknown broker order ID {update.OrderId}, skipping");
-                    return;
+                    // Try to find the QC order ID and symbol from our mapping
+                    if (!_brokerIdToQcOrderId.TryGetValue(update.OrderId, out var qcOrderId))
+                    {
+                        // Order not registered yet - queue the update for later processing
+                        // This handles the race condition where WebSocket events arrive before PlaceOrder completes
+                        Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Order ID {update.OrderId} not registered yet, queuing update");
+                        if (!_pendingOrderUpdates.TryGetValue(update.OrderId, out var pendingList))
+                        {
+                            pendingList = new List<TradovateOrderUpdate>();
+                            _pendingOrderUpdates[update.OrderId] = pendingList;
+                        }
+                        pendingList.Add(update);
+                        return;
+                    }
+
+                    ProcessOrderUpdate(update, qcOrderId);
                 }
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"TradovateBrokerage.OnTradovateOrderUpdate(): Error processing update: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Processes a single order update (extracted for reuse with pending updates)
+        /// </summary>
+        private void ProcessOrderUpdate(TradovateOrderUpdate update, int qcOrderId)
+        {
+            try
+            {
+
+                // Get the symbol for this order
+                var symbol = _brokerIdToSymbol.GetValueOrDefault(update.OrderId, Symbol.Empty);
 
                 // Map Tradovate status to QC status
                 var qcStatus = MapTradovateStatusToQc(update.OrdStatus);
@@ -1106,33 +1165,75 @@ namespace QuantConnect.Brokerages.Tradovate
 
                 Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Fill calculation - Previous={previousCumulativeFill}, Current={currentCumulativeFill}, Incremental={fillQuantity}");
 
+                // Skip firing OrderEvent if this is a Filled status from "order" entity type with no fill data
+                // The "order" entity doesn't have cumQty/avgPx fields - only executionReport does
+                // We'll get the proper fill data from the executionReport event
+                if (qcStatus.Value == OrderStatus.Filled && update.EntityType == "order" && fillQuantity == 0)
+                {
+                    Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Skipping duplicate Filled event from 'order' entity (no fill data), waiting for executionReport");
+                    // Still clean up mappings since this is a terminal status
+                    _brokerIdToQcOrderId.Remove(update.OrderId);
+                    _brokerIdToSymbol.Remove(update.OrderId);
+                    _cumulativeFillQuantity.Remove(update.OrderId);
+                    _pendingOrderUpdates.Remove(update.OrderId);
+                    return;
+                }
+
                 // Create and fire the order event
                 var direction = update.Action == "Buy" ? OrderDirection.Buy : OrderDirection.Sell;
+                // FillQuantity must be signed: positive for buys, negative for sells
+                var signedFillQuantity = direction == OrderDirection.Sell ? -fillQuantity : fillQuantity;
+                // Use Tradovate timestamp if available, otherwise fall back to current time
+                var eventTime = update.Timestamp ?? DateTime.UtcNow;
                 var orderEvent = new OrderEvent(
                     qcOrderId,
-                    Symbol.Empty,  // Will be filled by transaction handler
-                    DateTime.UtcNow,
+                    symbol,
+                    eventTime,
                     qcStatus.Value,
                     direction,
                     fillPrice,
-                    fillQuantity,
+                    signedFillQuantity,
                     OrderFee.Zero,
                     $"Tradovate: {update.OrdStatus}"
                 );
 
-                Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Firing OrderEvent - QC OrderId={qcOrderId}, Status={qcStatus.Value}, FillQty={fillQuantity}, FillPrice={fillPrice}");
+                Log.Trace($"TradovateBrokerage.OnTradovateOrderUpdate(): Firing OrderEvent - QC OrderId={qcOrderId}, Status={qcStatus.Value}, FillQty={signedFillQuantity}, FillPrice={fillPrice}");
                 OnOrderEvent(orderEvent);
 
                 // Clean up mappings if order is terminal
                 if (qcStatus.Value == OrderStatus.Filled || qcStatus.Value == OrderStatus.Canceled || qcStatus.Value == OrderStatus.Invalid)
                 {
                     _brokerIdToQcOrderId.Remove(update.OrderId);
+                    _brokerIdToSymbol.Remove(update.OrderId);
                     _cumulativeFillQuantity.Remove(update.OrderId);
+                    _pendingOrderUpdates.Remove(update.OrderId);
                 }
             }
             catch (Exception ex)
             {
-                Log.Error($"TradovateBrokerage.OnTradovateOrderUpdate(): Error processing update: {ex.Message}");
+                Log.Error($"TradovateBrokerage.ProcessOrderUpdate(): Error processing update: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Processes any pending order updates that were queued before the order was registered.
+        /// Called after registering an order to handle the race condition where WebSocket events
+        /// arrive before PlaceOrder completes.
+        /// </summary>
+        private void ProcessPendingOrderUpdates(long brokerId, int qcOrderId)
+        {
+            lock (_orderUpdateLock)
+            {
+                if (_pendingOrderUpdates.TryGetValue(brokerId, out var pendingUpdates) && pendingUpdates.Count > 0)
+                {
+                    Log.Trace($"TradovateBrokerage.ProcessPendingOrderUpdates(): Processing {pendingUpdates.Count} queued updates for broker order {brokerId}");
+                    foreach (var update in pendingUpdates)
+                    {
+                        Log.Trace($"TradovateBrokerage.ProcessPendingOrderUpdates(): Processing queued {update.EntityType} {update.EventType} - Status={update.OrdStatus}, FilledQty={update.FilledQty}");
+                        ProcessOrderUpdate(update, qcOrderId);
+                    }
+                    _pendingOrderUpdates.Remove(brokerId);
+                }
             }
         }
 
@@ -1152,11 +1253,14 @@ namespace QuantConnect.Brokerages.Tradovate
                 case "suspended":  // Order temporarily paused but still open
                     return OrderStatus.Submitted;
                 case "filled":
+                case "completed":  // Tradovate uses Completed for fully filled orders
                     return OrderStatus.Filled;
                 case "cancelled":
                 case "canceled":
                 case "expired":
                     return OrderStatus.Canceled;
+                case "unknown":  // Order state not yet determined
+                    return OrderStatus.None;
                 case "pendingcancel":
                     return OrderStatus.CancelPending;
                 case "pendingreplace":

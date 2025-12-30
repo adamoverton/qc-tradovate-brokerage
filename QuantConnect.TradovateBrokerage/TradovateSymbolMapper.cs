@@ -40,13 +40,22 @@ namespace QuantConnect.Brokerages.Tradovate
 
         private static readonly Dictionary<string, int> _expirationDays = new Dictionary<string, int>
         {
+            // Standard contracts
             { "ES", 15 },
             { "NQ", 15 },
             { "YM", 15 },
             { "RTY", 15 },
             { "CL", 20 },
             { "GC", 27 },
-            { "SI", 27 }
+            { "SI", 27 },
+            // Micro contracts with non-standard naming (M2K doesn't match RTY suffix pattern)
+            { "M2K", 15 },
+            { "MES", 15 },
+            { "MNQ", 15 },
+            { "MYM", 15 },
+            { "MCL", 20 },
+            { "MGC", 27 },
+            { "SIL", 27 }
         };
 
         public string GetBrokerageSymbol(Symbol symbol)
