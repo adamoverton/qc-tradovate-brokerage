@@ -45,7 +45,7 @@ namespace QuantConnect.Brokerages.Tradovate.Tests
                 var envKey = entry.Key.ToString();
                 var value = entry.Value.ToString();
 
-                if (envKey.StartsWith("QC_"))
+                if (envKey.StartsWith("QC_") && !string.IsNullOrEmpty(value))
                 {
                     var key = envKey.Substring(3).Replace("_", "-").ToLower();
 
