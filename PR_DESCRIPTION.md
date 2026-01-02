@@ -96,7 +96,7 @@ This PR fixes several field mapping issues discovered during a comprehensive rev
 
 ## Testing
 
-- Verified against Tradovate OpenAPI specification (`reference/tradovate-openapi.json`)
+- Verified against Tradovate OpenAPI specification (`docs/tradovate-openapi.json`)
 - **Live validation test** with Tradovate demo account (DEMO5583790):
   - Placed market BUY order → verified fill quantity (+1), fill price, symbol, timestamp
   - Placed market SELL order → verified negative fill quantity (-1), fill price, symbol, timestamp
@@ -111,7 +111,7 @@ This PR fixes several field mapping issues discovered during a comprehensive rev
 
 ## Documentation
 
-Added comprehensive field mapping documentation in `reference/MAPPING_REVIEW_CHECKLIST.md` covering:
+Added comprehensive field mapping documentation in `docs/MAPPING_REVIEW_CHECKLIST.md` covering:
 - All 15+ inbound and outbound mapping locations
 - Field-by-field verification against OpenAPI spec
 - Issue tracking and fix status
