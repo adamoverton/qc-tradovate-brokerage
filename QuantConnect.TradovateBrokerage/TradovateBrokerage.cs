@@ -914,7 +914,7 @@ namespace QuantConnect.Brokerages.Tradovate
 
                     // Initialize connection handler for automatic reconnection
                     _connectionHandler = new DefaultConnectionHandler();
-                    _connectionHandler.MaximumIdleTimeSpan = TimeSpan.FromSeconds(5);  // Allow 2 missed heartbeats (2.5s interval)
+                    _connectionHandler.MaximumIdleTimeSpan = TimeSpan.FromSeconds(30);  // Tradovate heartbeats every 10-17s, allow for missed heartbeats
                     _connectionHandler.ReconnectRequested += OnReconnectRequested;
                     _connectionHandler.ConnectionLost += (s, e) => OnMessage(new BrokerageMessageEvent(
                         BrokerageMessageType.Warning, "WebSocket", "Connection lost - attempting to reconnect"));
@@ -932,6 +932,9 @@ namespace QuantConnect.Brokerages.Tradovate
 
                 // Subscribe to token refresh events to update REST and WebSocket clients
                 _authManager.TokenRefreshed += OnTokenRefreshed;
+
+                // Subscribe to auth failure events to notify algorithm
+                _authManager.AuthenticationFailed += OnAuthenticationFailed;
 
                 // Start automatic token refresh timer
                 _authManager.StartAutoRefresh();
@@ -970,6 +973,63 @@ namespace QuantConnect.Brokerages.Tradovate
         }
 
         /// <summary>
+        /// Handles authentication failure events from the auth manager.
+        /// Emits a brokerage message that the algorithm can handle to provide a fresh token.
+        /// </summary>
+        private void OnAuthenticationFailed(object sender, AuthenticationFailedEventArgs e)
+        {
+            Log.Error($"TradovateBrokerage.OnAuthenticationFailed(): {e.Reason} (failures: {e.FailureCount})");
+
+            // Emit message with code "AuthenticationExpired" so algorithm can handle it
+            // Algorithm should fetch fresh token from secrets manager and call UpdateOAuthToken()
+            OnMessage(new BrokerageMessageEvent(
+                BrokerageMessageType.Error,
+                "AuthenticationExpired",
+                $"OAuth token expired and cannot be renewed. Failures: {e.FailureCount}. " +
+                "Call brokerage.UpdateOAuthToken() with a fresh token from your credential store."));
+        }
+
+        /// <summary>
+        /// Updates the OAuth token from an external source (e.g., AWS Secrets Manager).
+        /// Call this method when you receive an "AuthenticationExpired" brokerage message.
+        /// </summary>
+        /// <param name="newToken">The new OAuth token</param>
+        /// <returns>True if the token was accepted and validated</returns>
+        public bool UpdateOAuthToken(string newToken)
+        {
+            if (_authManager == null)
+            {
+                Log.Error("TradovateBrokerage.UpdateOAuthToken(): Auth manager not initialized");
+                return false;
+            }
+
+            Log.Trace("TradovateBrokerage.UpdateOAuthToken(): Updating OAuth token from external source");
+            var success = _authManager.UpdateToken(newToken);
+
+            if (success)
+            {
+                // Update REST and WebSocket clients with new token
+                var accessToken = _authManager.GetAccessToken();
+                _restClient?.UpdateAccessToken(accessToken);
+                _webSocketClient?.UpdateAccessToken(accessToken);
+
+                OnMessage(new BrokerageMessageEvent(
+                    BrokerageMessageType.Information,
+                    "TokenRefresh",
+                    "OAuth token updated successfully from external source"));
+            }
+            else
+            {
+                OnMessage(new BrokerageMessageEvent(
+                    BrokerageMessageType.Error,
+                    "TokenRefresh",
+                    "Failed to update OAuth token - token may be invalid"));
+            }
+
+            return success;
+        }
+
+        /// <summary>
         /// Disconnects the client from the broker's remote servers
         /// </summary>
         public override void Disconnect()
@@ -989,6 +1049,7 @@ namespace QuantConnect.Brokerages.Tradovate
                 if (_authManager != null)
                 {
                     _authManager.TokenRefreshed -= OnTokenRefreshed;
+                    _authManager.AuthenticationFailed -= OnAuthenticationFailed;
                     _authManager.StopAutoRefresh();
                     _authManager.Dispose();
                     _authManager = null;
@@ -1033,7 +1094,10 @@ namespace QuantConnect.Brokerages.Tradovate
 
         private void OnWebSocketError(object sender, Exception ex)
         {
-            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "WebSocket", $"WebSocket error: {ex.Message}"));
+            // Use Warning instead of Error - WebSocket failures should trigger reconnection, not algorithm termination
+            // The DefaultConnectionHandler will handle reconnection attempts
+            Log.Error($"TradovateBrokerage.OnWebSocketError(): {ex.Message}");
+            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "WebSocket", $"WebSocket error: {ex.Message}"));
         }
 
         /// <summary>

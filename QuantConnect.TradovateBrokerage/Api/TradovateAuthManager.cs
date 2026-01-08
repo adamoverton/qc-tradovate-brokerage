@@ -24,6 +24,10 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         private Timer _refreshTimer;
         private bool _disposed;
 
+        // Track consecutive failures for external handlers
+        private int _consecutiveRefreshFailures;
+        private const int MaxRefreshFailuresBeforeEvent = 3;
+
         // Refresh token 60 seconds before expiration (Tradovate recommends 30s, we use 60s for safety)
         private const int RefreshBufferSeconds = 60;
         // Default token lifetime is ~80 minutes, but we track actual expiration from API response
@@ -33,6 +37,12 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         /// Event raised when the access token is refreshed
         /// </summary>
         public event EventHandler<TokenRefreshedEventArgs> TokenRefreshed;
+
+        /// <summary>
+        /// Event raised when authentication fails after multiple retry attempts.
+        /// External handlers can use this to fetch a new token and call UpdateToken().
+        /// </summary>
+        public event EventHandler<AuthenticationFailedEventArgs> AuthenticationFailed;
 
         public TradovateAuthManager(
             string username,
@@ -62,6 +72,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
             _accessToken = oauthToken;
             // For OAuth tokens, set default expiration - will be updated when we refresh
             _tokenExpiration = DateTime.UtcNow.Add(DefaultTokenLifetime);
+            _consecutiveRefreshFailures = 0;
         }
 
         public bool IsAuthenticated => !string.IsNullOrEmpty(_accessToken);
@@ -78,6 +89,47 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         /// Gets the token expiration time in UTC
         /// </summary>
         public DateTime TokenExpiration => _tokenExpiration;
+
+        /// <summary>
+        /// Updates the access token with a new value from an external source.
+        /// Use this when the AuthenticationFailed event is raised to provide a fresh token.
+        /// </summary>
+        /// <param name="newToken">The new OAuth token to use</param>
+        /// <returns>True if the token was updated and renewal succeeded</returns>
+        public bool UpdateToken(string newToken)
+        {
+            if (string.IsNullOrEmpty(newToken))
+            {
+                Log.Error("TradovateAuthManager.UpdateToken(): New token is null or empty");
+                return false;
+            }
+
+            Log.Trace("TradovateAuthManager.UpdateToken(): Updating access token from external source");
+            _accessToken = newToken;
+            _tokenExpiration = DateTime.UtcNow.Add(DefaultTokenLifetime);
+            _consecutiveRefreshFailures = 0;
+
+            // Try to renew immediately to get proper expiration and validate the token
+            var renewSuccess = RenewAccessToken();
+            if (renewSuccess)
+            {
+                Log.Trace($"TradovateAuthManager.UpdateToken(): Token validated, expires at {_tokenExpiration:yyyy-MM-dd HH:mm:ss} UTC");
+
+                // Reschedule the refresh timer
+                var timeUntilRefresh = CalculateTimeUntilRefresh();
+                if (timeUntilRefresh > TimeSpan.Zero && _refreshTimer != null)
+                {
+                    _refreshTimer.Change(timeUntilRefresh, Timeout.InfiniteTimeSpan);
+                    Log.Trace($"TradovateAuthManager.UpdateToken(): Next refresh scheduled in {timeUntilRefresh.TotalMinutes:F1} minutes");
+                }
+            }
+            else
+            {
+                Log.Error("TradovateAuthManager.UpdateToken(): Token renewal failed - token may be invalid");
+            }
+
+            return renewSuccess;
+        }
 
         public string GetApiUrl()
         {
@@ -177,12 +229,56 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 return;
             }
 
-            // Calculate when to refresh (before expiration)
-            var timeUntilRefresh = CalculateTimeUntilRefresh();
-            if (timeUntilRefresh <= TimeSpan.Zero)
+            // For OAuth tokens, we don't know the actual expiration time.
+            // Always refresh immediately on startup to get a fresh token with known expiration.
+            // This handles the case where the algorithm restarts multiple times with the same
+            // initial OAuth token - each restart would otherwise assume 75 minutes remaining.
+            TimeSpan timeUntilRefresh;
+            if (_useOAuth)
             {
-                // Token already expired or about to expire, refresh immediately
-                timeUntilRefresh = TimeSpan.FromSeconds(1);
+                Log.Trace("TradovateAuthManager.StartAutoRefresh(): OAuth mode - refreshing immediately to get known expiration");
+                var success = RenewAccessToken();
+                if (!success)
+                {
+                    _consecutiveRefreshFailures++;
+                    Log.Error($"TradovateAuthManager.StartAutoRefresh(): Initial token refresh failed - token is expired");
+
+                    // Token is expired on startup - raise event and exit (no retry, auth failure is fatal)
+                    Log.Trace("TradovateAuthManager.StartAutoRefresh(): Token expired - raising AuthenticationFailed event (fatal, no retry)");
+                    try
+                    {
+                        AuthenticationFailed?.Invoke(this, new AuthenticationFailedEventArgs(
+                            _consecutiveRefreshFailures,
+                            "OAuth token expired on startup and cannot be renewed"));
+                    }
+                    catch (Exception eventEx)
+                    {
+                        Log.Error($"TradovateAuthManager.StartAutoRefresh(): Exception in AuthenticationFailed handler: {eventEx.Message}");
+                    }
+
+                    // Don't schedule retry timer - auth failure is fatal, algorithm should exit
+                    return;
+                }
+                else
+                {
+                    _consecutiveRefreshFailures = 0;
+                    // Calculate when to refresh (before expiration)
+                    timeUntilRefresh = CalculateTimeUntilRefresh();
+                    if (timeUntilRefresh <= TimeSpan.Zero)
+                    {
+                        timeUntilRefresh = TimeSpan.FromSeconds(30);
+                    }
+                }
+            }
+            else
+            {
+                // Calculate when to refresh (before expiration)
+                timeUntilRefresh = CalculateTimeUntilRefresh();
+                if (timeUntilRefresh <= TimeSpan.Zero)
+                {
+                    // Token already expired or about to expire, refresh soon
+                    timeUntilRefresh = TimeSpan.FromSeconds(30);
+                }
             }
 
             Log.Trace($"TradovateAuthManager.StartAutoRefresh(): Token expires at {_tokenExpiration:yyyy-MM-dd HH:mm:ss} UTC, scheduling refresh in {timeUntilRefresh.TotalMinutes:F1} minutes");
@@ -224,6 +320,7 @@ namespace QuantConnect.Brokerages.Tradovate.Api
 
                 if (success)
                 {
+                    _consecutiveRefreshFailures = 0;
                     // Reschedule for the next refresh
                     var timeUntilRefresh = CalculateTimeUntilRefresh();
                     if (timeUntilRefresh > TimeSpan.Zero)
@@ -234,14 +331,34 @@ namespace QuantConnect.Brokerages.Tradovate.Api
                 }
                 else
                 {
-                    // Refresh failed, retry in 30 seconds
-                    Log.Error("TradovateAuthManager: Token refresh failed, retrying in 30 seconds");
+                    _consecutiveRefreshFailures++;
+                    Log.Error($"TradovateAuthManager: Token refresh failed ({_consecutiveRefreshFailures}/{MaxRefreshFailuresBeforeEvent})");
+
+                    // After multiple failures, raise event so external handlers can provide a new token
+                    if (_consecutiveRefreshFailures >= MaxRefreshFailuresBeforeEvent)
+                    {
+                        Log.Trace("TradovateAuthManager: Multiple refresh failures - raising AuthenticationFailed event");
+                        try
+                        {
+                            AuthenticationFailed?.Invoke(this, new AuthenticationFailedEventArgs(
+                                _consecutiveRefreshFailures,
+                                "Token refresh failed after multiple attempts"));
+                        }
+                        catch (Exception eventEx)
+                        {
+                            Log.Error($"TradovateAuthManager: Exception in AuthenticationFailed handler: {eventEx.Message}");
+                        }
+                    }
+
+                    // Retry in 30 seconds
+                    Log.Trace("TradovateAuthManager: Retrying in 30 seconds");
                     _refreshTimer?.Change(TimeSpan.FromSeconds(30), Timeout.InfiniteTimeSpan);
                 }
             }
             catch (Exception ex)
             {
                 Log.Error($"TradovateAuthManager: Exception in refresh timer: {ex.Message}");
+                _consecutiveRefreshFailures++;
                 // Retry in 30 seconds
                 _refreshTimer?.Change(TimeSpan.FromSeconds(30), Timeout.InfiniteTimeSpan);
             }
@@ -373,6 +490,28 @@ namespace QuantConnect.Brokerages.Tradovate.Api
         {
             NewAccessToken = newAccessToken;
             Expiration = expiration;
+        }
+    }
+
+    /// <summary>
+    /// Event args for the AuthenticationFailed event
+    /// </summary>
+    public class AuthenticationFailedEventArgs : EventArgs
+    {
+        /// <summary>
+        /// Number of consecutive refresh failures
+        /// </summary>
+        public int FailureCount { get; }
+
+        /// <summary>
+        /// Description of the failure reason
+        /// </summary>
+        public string Reason { get; }
+
+        public AuthenticationFailedEventArgs(int failureCount, string reason)
+        {
+            FailureCount = failureCount;
+            Reason = reason;
         }
     }
 }
